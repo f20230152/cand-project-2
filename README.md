@@ -13,7 +13,7 @@ Interactive Streamlit dashboard for evaluating quantitative strategy robustness 
 
 ```bash
 pip install -r requirements.txt
-streamlit run dashboard.py
+streamlit run streamlit_app.py
 ```
 
 ## Data and outputs
@@ -30,6 +30,6 @@ The app can use these directly for fast startup.
 1. Push this repository to GitHub.
 2. Open Streamlit Community Cloud and create a new app from the repo.
 3. Set:
-   - Main file path: `dashboard.py`
+   - Main file path: `streamlit_app.py`
    - Python dependencies: `requirements.txt`
 4. Deploy and share the generated app URL.

@@ -1143,7 +1143,29 @@ def render_final_submission_page(show_tutor: bool) -> None:
         index=final_pnl.index,
     )
     fig = px.line(compare.reset_index(), x="date", y=compare.columns.tolist(), title="Final Strategy vs Benchmarks")
-    fig.add_vline(x=compare.index[min(split_idx, len(compare.index) - 1)], line_dash="dash", annotation_text="Train/Test Split")
+    if not compare.empty:
+        split_loc = min(max(split_idx, 0), len(compare.index) - 1)
+        split_dt = pd.to_datetime(compare.index[split_loc]).to_pydatetime()
+        fig.add_shape(
+            type="line",
+            x0=split_dt,
+            x1=split_dt,
+            y0=0,
+            y1=1,
+            xref="x",
+            yref="paper",
+            line=dict(dash="dash", color="#7f7f7f"),
+        )
+        fig.add_annotation(
+            x=split_dt,
+            y=1.0,
+            xref="x",
+            yref="paper",
+            text="Train/Test Split",
+            showarrow=False,
+            yshift=10,
+            font=dict(size=11, color="#7f7f7f"),
+        )
     st.plotly_chart(fig, use_container_width=True)
 
     is_oos = pd.DataFrame(

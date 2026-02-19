@@ -2,6 +2,8 @@
 
 Interactive Streamlit dashboard for evaluating quantitative strategy robustness and survival diagnostics on crude oil data.
 
+[![Deploy to Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://share.streamlit.io/deploy?repository=https://github.com/f20230152/cand-project-2&branch=main&mainModule=streamlit_app.py)
+
 ## What this includes
 
 - Strategy ranking and explainers

@@ -1353,185 +1353,245 @@ def _pick_model_row(model_table: pd.DataFrame, model_names: List[str]) -> pd.Ser
 
 
 @st.cache_data(show_spinner=True)
-def build_top_feature_combo_presets(
-    top_k: int,
-    min_trades_per_year: float,
-    split_ratio: float,
-    ridge_alpha: float,
-    gb_rounds: int,
-    gb_learning_rate: float,
-    combo_size: int = 3,
-    feature_search_cap: int = 8,
-    candidate_cap: int = 40,
-    top_n: int = 5,
-) -> pd.DataFrame:
-    pool = build_submission_feature_pool(min_trades_per_year=float(min_trades_per_year))
-    eligible = pool["eligible"].copy()
-    if eligible.empty:
-        return pd.DataFrame(
-            columns=[
-                "rank",
-                "preset_label",
-                "features_csv",
-                "features_display",
-                "mean_oos_ann_return",
-                "mean_oos_sharpe",
-                "beat_rate",
-                "lr_oos_ann_return",
-                "gb_oos_ann_return",
-                "ens_oos_ann_return",
-            ]
-        )
-
-    ranked = eligible.sort_values(["walkforward_ann_return", "selection_score"], ascending=False).reset_index(drop=True)
-    top_features = [str(x) for x in ranked["strategy"].head(int(max(feature_search_cap, combo_size))).tolist()]
-    if len(top_features) < int(combo_size):
-        return pd.DataFrame(
-            columns=[
-                "rank",
-                "preset_label",
-                "features_csv",
-                "features_display",
-                "mean_oos_ann_return",
-                "mean_oos_sharpe",
-                "beat_rate",
-                "lr_oos_ann_return",
-                "gb_oos_ann_return",
-                "ens_oos_ann_return",
-            ]
-        )
+def _build_fixed_feature_combo_candidates(
+    eligible: pd.DataFrame,
+    max_seed_features: int = 14,
+    shortlist_cap: int = 20,
+) -> List[Tuple[str, ...]]:
+    ranked = eligible.sort_values(
+        ["walkforward_ann_return", "sample_sharpe", "selection_score"],
+        ascending=False,
+    ).reset_index(drop=True)
+    seed_features = [str(x) for x in ranked["strategy"].head(int(max_seed_features)).tolist()]
+    if len(seed_features) < 3:
+        return []
 
     family_lookup = ranked.set_index("strategy")["family"].astype(str).to_dict()
-    ann_lookup = ranked.set_index("strategy")["walkforward_ann_return"].astype(float).to_dict()
+    valid_sizes = [s for s in [3, 4, 5, 6, 7, 8, 9] if s <= len(seed_features)]
+    combo_set: set[Tuple[str, ...]] = set()
 
-    all_combos = list(itertools.combinations(top_features, int(combo_size)))
-    diverse_combos = [c for c in all_combos if len({family_lookup.get(s, "") for s in c}) >= min(int(combo_size), 3)]
-    working = diverse_combos if diverse_combos else all_combos
-    working = sorted(
-        working,
-        key=lambda c: (
-            float(sum(ann_lookup.get(str(s), 0.0) for s in c)),
-            float(len({family_lookup.get(str(s), "") for s in c})),
-        ),
-        reverse=True,
-    )
+    for size in valid_sizes:
+        combo_set.add(tuple(seed_features[:size]))
 
-    default_features = tuple(str(s) for s in list(pool["default_features"])[: int(combo_size)])
-    deduped: List[Tuple[str, ...]] = []
-    if len(default_features) == int(combo_size):
-        deduped.append(default_features)
-    for combo in working:
-        combo_t = tuple(str(s) for s in combo)
-        if combo_t not in deduped:
-            deduped.append(combo_t)
-        if len(deduped) >= int(candidate_cap):
-            break
+    ranking_variants = [
+        ["walkforward_ann_return", "sample_sharpe", "selection_score"],
+        ["sample_sharpe", "walkforward_ann_return", "selection_score"],
+        ["selection_score", "walkforward_ann_return", "sample_sharpe"],
+    ]
+    for cols in ranking_variants:
+        ordered = (
+            ranked.sort_values(cols, ascending=False)["strategy"]
+            .astype(str)
+            .head(int(max_seed_features))
+            .tolist()
+        )
+        for size in valid_sizes:
+            picks: List[str] = []
+            used_families = set()
+            for strat in ordered:
+                fam = family_lookup.get(strat, "")
+                if fam not in used_families:
+                    picks.append(strat)
+                    used_families.add(fam)
+                if len(picks) >= size:
+                    break
+            if len(picks) < size:
+                extras = [s for s in ordered if s not in picks]
+                picks.extend(extras[: size - len(picks)])
+            if len(picks) == size:
+                combo_set.add(tuple(picks))
 
+    small_pool = seed_features[: min(9, len(seed_features))]
+    for size in [3, 4]:
+        if len(small_pool) < size:
+            continue
+        for combo in itertools.combinations(small_pool, size):
+            combo_set.add(tuple(combo))
+
+    rng = np.random.default_rng(20260219)
+    for _ in range(240):
+        size = int(rng.choice(valid_sizes))
+        idx = sorted(rng.choice(len(seed_features), size=size, replace=False))
+        combo_set.add(tuple(seed_features[int(i)] for i in idx))
+
+    lookup = ranked.set_index("strategy")[["walkforward_ann_return", "sample_sharpe", "selection_score", "family"]].copy()
     rows: List[Dict[str, object]] = []
-    for combo in deduped:
-        bundle = build_final_submission_payload(
-            top_k=int(top_k),
-            min_trades_per_year=float(min_trades_per_year),
-            split_ratio=float(split_ratio),
-            ridge_alpha=float(ridge_alpha),
-            gb_rounds=int(gb_rounds),
-            gb_learning_rate=float(gb_learning_rate),
-            selected_features=tuple(combo),
-        )
-        if bundle.get("error"):
+    for combo in combo_set:
+        names = list(combo)
+        if any(name not in lookup.index for name in names):
             continue
-        model_table = bundle.get("model_table", pd.DataFrame())
-        if not isinstance(model_table, pd.DataFrame) or model_table.empty:
-            continue
-
-        lr_row = _pick_model_row(
-            model_table,
-            ["Linear Regression (Quarterly Rebalanced OOS)", "Linear Regression"],
-        )
-        gb_row = _pick_model_row(
-            model_table,
-            ["Gradient Boosting Proxy (Quarterly Rebalanced OOS)", "Gradient Boosting Proxy"],
-        )
-        ens_row = _pick_model_row(
-            model_table,
-            ["Ensemble (Quarterly Rebalanced OOS)", "Ensemble (50/50)"],
-        )
-        if lr_row.empty or gb_row.empty or ens_row.empty:
-            continue
-
-        lr_ann = float(lr_row.get("out_sample_ann_return", np.nan))
-        gb_ann = float(gb_row.get("out_sample_ann_return", np.nan))
-        ens_ann = float(ens_row.get("out_sample_ann_return", np.nan))
-        lr_sharpe = float(lr_row.get("out_sample_sharpe", np.nan))
-        gb_sharpe = float(gb_row.get("out_sample_sharpe", np.nan))
-        ens_sharpe = float(ens_row.get("out_sample_sharpe", np.nan))
-        lr_beats = 1.0 if bool(lr_row.get("beats_brent_oos", False)) else 0.0
-        gb_beats = 1.0 if bool(gb_row.get("beats_brent_oos", False)) else 0.0
-        ens_beats = 1.0 if bool(ens_row.get("beats_brent_oos", False)) else 0.0
-
+        sub = lookup.loc[names]
         rows.append(
             {
-                "features_csv": "|".join(combo),
-                "features_display": ", ".join(combo),
-                "lr_oos_ann_return": lr_ann,
-                "gb_oos_ann_return": gb_ann,
-                "ens_oos_ann_return": ens_ann,
-                "lr_oos_sharpe": lr_sharpe,
-                "gb_oos_sharpe": gb_sharpe,
-                "ens_oos_sharpe": ens_sharpe,
-                "mean_oos_ann_return": float(np.nanmean([lr_ann, gb_ann, ens_ann])),
-                "mean_oos_sharpe": float(np.nanmean([lr_sharpe, gb_sharpe, ens_sharpe])),
-                "beat_rate": float(np.nanmean([lr_beats, gb_beats, ens_beats])),
+                "features_csv": "|".join(names),
+                "mean_wf_ann_return": float(sub["walkforward_ann_return"].mean()),
+                "mean_sample_sharpe": float(sub["sample_sharpe"].mean()),
+                "max_wf_ann_return": float(sub["walkforward_ann_return"].max()),
+                "family_diversity": float(sub["family"].nunique() / max(len(names), 1)),
+                "feature_count": len(names),
             }
         )
-
     if not rows:
-        return pd.DataFrame(
-            columns=[
-                "rank",
-                "preset_label",
-                "features_csv",
-                "features_display",
-                "mean_oos_ann_return",
-                "mean_oos_sharpe",
-                "beat_rate",
-                "lr_oos_ann_return",
-                "gb_oos_ann_return",
-                "ens_oos_ann_return",
-            ]
-        )
+        return []
 
     combo_df = pd.DataFrame(rows).drop_duplicates(subset=["features_csv"]).reset_index(drop=True)
-    combo_df["combo_score"] = (
-        0.55 * _selection_score(combo_df["mean_oos_ann_return"])
-        + 0.30 * _selection_score(combo_df["mean_oos_sharpe"])
-        + 0.15 * _selection_score(combo_df["beat_rate"])
+    combo_df["heuristic_score"] = (
+        0.45 * _selection_score(combo_df["mean_wf_ann_return"])
+        + 0.30 * _selection_score(combo_df["mean_sample_sharpe"])
+        + 0.15 * _selection_score(combo_df["max_wf_ann_return"])
+        + 0.10 * _selection_score(combo_df["family_diversity"])
     )
     combo_df = combo_df.sort_values(
-        ["combo_score", "mean_oos_ann_return", "mean_oos_sharpe"],
+        ["heuristic_score", "mean_wf_ann_return", "mean_sample_sharpe", "family_diversity"],
         ascending=False,
-    ).head(int(top_n)).reset_index(drop=True)
-    combo_df["rank"] = np.arange(1, len(combo_df) + 1)
-    combo_df["preset_label"] = combo_df.apply(
+    ).head(int(shortlist_cap))
+    return [tuple(str(x) for x in str(v).split("|")) for v in combo_df["features_csv"].tolist()]
+
+
+@st.cache_data(show_spinner=True)
+def build_fixed_submission_proposals(top_n: int = 5) -> pd.DataFrame:
+    fixed_top_k = 10
+    fixed_min_trades = 20.0
+    param_grid = [
+        (0.70, 3.0, 80, 0.08),
+        (0.70, 6.0, 80, 0.08),
+        (0.70, 3.0, 120, 0.08),
+        (0.70, 6.0, 120, 0.08),
+        (0.75, 3.0, 80, 0.08),
+        (0.75, 6.0, 80, 0.08),
+        (0.75, 3.0, 120, 0.08),
+        (0.75, 6.0, 120, 0.08),
+    ]
+    empty_cols = [
+        "rank",
+        "proposal_label",
+        "features_csv",
+        "features_display",
+        "feature_count",
+        "final_model",
+        "top_k",
+        "min_trades_per_year",
+        "split_ratio",
+        "ridge_alpha",
+        "gb_rounds",
+        "gb_learning_rate",
+        "out_sample_ann_return",
+        "out_sample_sharpe",
+        "out_sample_max_drawdown",
+        "full_sample_ann_return",
+        "full_sample_sharpe",
+        "oos_excess_ann_return_vs_brent",
+        "oos_excess_sharpe_vs_brent",
+        "beats_brent_oos",
+    ]
+
+    pool = build_submission_feature_pool(min_trades_per_year=float(fixed_min_trades))
+    eligible = pool["eligible"].copy()
+    if eligible.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    combo_candidates = _build_fixed_feature_combo_candidates(
+        eligible=eligible,
+        max_seed_features=14,
+        shortlist_cap=20,
+    )
+    if not combo_candidates:
+        return pd.DataFrame(columns=empty_cols)
+
+    rows: List[Dict[str, object]] = []
+    for combo in combo_candidates:
+        for split_ratio, ridge_alpha, gb_rounds, gb_learning_rate in param_grid:
+            bundle = build_final_submission_payload(
+                top_k=int(fixed_top_k),
+                min_trades_per_year=float(fixed_min_trades),
+                split_ratio=float(split_ratio),
+                ridge_alpha=float(ridge_alpha),
+                gb_rounds=int(gb_rounds),
+                gb_learning_rate=float(gb_learning_rate),
+                selected_features=tuple(combo),
+            )
+            if bundle.get("error"):
+                continue
+            model_table = bundle.get("model_table", pd.DataFrame())
+            if not isinstance(model_table, pd.DataFrame) or model_table.empty:
+                continue
+            candidate_models = model_table[
+                model_table["model"].isin(
+                    [
+                        "Linear Regression (Quarterly Rebalanced OOS)",
+                        "Gradient Boosting Proxy (Quarterly Rebalanced OOS)",
+                        "Ensemble (Quarterly Rebalanced OOS)",
+                    ]
+                )
+            ].copy()
+            if candidate_models.empty:
+                continue
+            candidate_models = candidate_models.sort_values(
+                [
+                    "beats_brent_oos",
+                    "oos_excess_ann_return_vs_brent",
+                    "out_sample_ann_return",
+                    "out_sample_sharpe",
+                    "full_sample_ann_return",
+                ],
+                ascending=False,
+            ).reset_index(drop=True)
+            best = candidate_models.iloc[0]
+            rows.append(
+                {
+                    "features_csv": "|".join(combo),
+                    "features_display": ", ".join(combo),
+                    "feature_count": len(combo),
+                    "final_model": str(best["model"]),
+                    "top_k": int(fixed_top_k),
+                    "min_trades_per_year": float(fixed_min_trades),
+                    "split_ratio": float(split_ratio),
+                    "ridge_alpha": float(ridge_alpha),
+                    "gb_rounds": int(gb_rounds),
+                    "gb_learning_rate": float(gb_learning_rate),
+                    "out_sample_ann_return": float(best["out_sample_ann_return"]),
+                    "out_sample_sharpe": float(best["out_sample_sharpe"]),
+                    "out_sample_max_drawdown": float(best["out_sample_max_drawdown"]),
+                    "full_sample_ann_return": float(best["full_sample_ann_return"]),
+                    "full_sample_sharpe": float(best["full_sample_sharpe"]),
+                    "oos_excess_ann_return_vs_brent": float(best["oos_excess_ann_return_vs_brent"]),
+                    "oos_excess_sharpe_vs_brent": float(best["oos_excess_sharpe_vs_brent"]),
+                    "beats_brent_oos": bool(best["beats_brent_oos"]),
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(columns=empty_cols)
+
+    proposals = pd.DataFrame(rows)
+    proposals = proposals.sort_values(
+        [
+            "beats_brent_oos",
+            "oos_excess_ann_return_vs_brent",
+            "out_sample_ann_return",
+            "out_sample_sharpe",
+            "full_sample_ann_return",
+        ],
+        ascending=False,
+    )
+    proposals = proposals.drop_duplicates(
+        subset=["features_csv", "final_model", "split_ratio", "ridge_alpha", "gb_rounds", "gb_learning_rate"],
+        keep="first",
+    )
+    beaters = proposals[proposals["beats_brent_oos"]].copy()
+    if len(beaters) >= int(top_n):
+        proposals = beaters
+    proposals = proposals.head(int(top_n)).reset_index(drop=True)
+    proposals["rank"] = np.arange(1, len(proposals) + 1)
+    proposals["proposal_label"] = proposals.apply(
         lambda r: (
-            f"Top {int(r['rank'])} | OOS Ann {float(r['mean_oos_ann_return']):.1%} | "
-            f"OOS Sharpe {float(r['mean_oos_sharpe']):.2f} | Brent beat {float(r['beat_rate']):.0%}"
+            f"Top {int(r['rank'])} | {str(r['final_model'])} | "
+            f"{int(r['feature_count'])}F | OOS Ann {float(r['out_sample_ann_return']):.1%} | Sharpe {float(r['out_sample_sharpe']):.2f} | "
+            f"Brent {'Yes' if bool(r['beats_brent_oos']) else 'No'}"
         ),
         axis=1,
     )
-    keep_cols = [
-        "rank",
-        "preset_label",
-        "features_csv",
-        "features_display",
-        "mean_oos_ann_return",
-        "mean_oos_sharpe",
-        "beat_rate",
-        "lr_oos_ann_return",
-        "gb_oos_ann_return",
-        "ens_oos_ann_return",
-    ]
-    return combo_df[keep_cols].copy()
+    return proposals[empty_cols].copy()
 
 
 def render_final_submission_page(show_tutor: bool) -> None:
@@ -1548,16 +1608,31 @@ def render_final_submission_page(show_tutor: bool) -> None:
         "Model-based strategies are quarterly rebalanced in the test period."
     )
 
+    show_fixed_key = "final_submission_show_fixed_best5"
+    forced_model_key = "final_submission_forced_model"
+    if show_fixed_key not in st.session_state:
+        st.session_state[show_fixed_key] = False
+
+    if st.button("Show Best 5 Proposed Strategies", key="final_submission_show_best5_button"):
+        st.session_state[show_fixed_key] = True
+
     c1, c2, c3, c4 = st.columns(4)
-    top_k = c1.slider("Auto shortlist size", min_value=3, max_value=20, value=10, step=1)
-    min_trades = c2.number_input("Minimum trades/year filter", min_value=1.0, max_value=100.0, value=20.0, step=1.0)
-    split_ratio = c3.slider("Train ratio", min_value=0.60, max_value=0.85, value=0.70, step=0.05)
+    top_k = c1.slider("Auto shortlist size", min_value=3, max_value=20, value=10, step=1, key="final_submission_top_k")
+    min_trades = c2.number_input(
+        "Minimum trades/year filter",
+        min_value=1.0,
+        max_value=100.0,
+        value=20.0,
+        step=1.0,
+        key="final_submission_min_trades",
+    )
+    split_ratio = c3.slider("Train ratio", min_value=0.60, max_value=0.85, value=0.70, step=0.05, key="final_submission_split_ratio")
     c4.metric("Test Rebalance", "Quarterly")
 
     m1, m2 = st.columns(2)
-    ridge_alpha = m1.number_input("Ridge alpha", min_value=0.1, max_value=20.0, value=4.0, step=0.1)
-    gb_rounds = int(m2.slider("Boosting rounds", min_value=20, max_value=200, value=80, step=10))
-    gb_lr = st.slider("Boosting learning rate", min_value=0.01, max_value=0.50, value=0.08, step=0.01)
+    ridge_alpha = m1.number_input("Ridge alpha", min_value=0.1, max_value=20.0, value=4.0, step=0.1, key="final_submission_ridge_alpha")
+    gb_rounds = int(m2.slider("Boosting rounds", min_value=20, max_value=200, value=80, step=10, key="final_submission_gb_rounds"))
+    gb_lr = st.slider("Boosting learning rate", min_value=0.01, max_value=0.50, value=0.08, step=0.01, key="final_submission_gb_lr")
 
     feature_pool = build_submission_feature_pool(min_trades_per_year=float(min_trades))
     eligible_pool = feature_pool["eligible"].copy()
@@ -1566,13 +1641,43 @@ def render_final_submission_page(show_tutor: bool) -> None:
         st.warning(f"No strategies satisfy trades/year >= {min_trades}. Lower the threshold.")
         return
 
+    fixed_proposals = build_fixed_submission_proposals(top_n=5)
+    if st.session_state.get(show_fixed_key, False):
+        st.markdown("### Best 5 Proposed Strategies To Implement (Fixed)")
+        st.caption(
+            "These proposals are precomputed from broad feature-count and alpha-grid search. They are fixed and do not re-rank with page sliders."
+        )
+        if fixed_proposals.empty:
+            st.warning("No fixed proposals are available right now.")
+        else:
+            st.dataframe(
+                fixed_proposals[
+                    [
+                        "rank",
+                        "final_model",
+                        "feature_count",
+                        "split_ratio",
+                        "ridge_alpha",
+                        "gb_rounds",
+                        "gb_learning_rate",
+                        "out_sample_ann_return",
+                        "out_sample_sharpe",
+                        "oos_excess_ann_return_vs_brent",
+                        "beats_brent_oos",
+                        "features_display",
+                    ]
+                ].round(4),
+                use_container_width=True,
+                hide_index=True,
+            )
+
     st.markdown("### Feature Basket Control")
     st.caption(
         "Default basket = top 3 by walkforward annualized return, each from different families when available."
     )
     selection_key = "final_submission_feature_basket"
-    combo_choice_key = "final_submission_top_combo_choice"
-    combo_applied_key = "final_submission_top_combo_applied"
+    proposal_choice_key = "final_submission_fixed_proposal_choice"
+    proposal_applied_key = "final_submission_fixed_proposal_applied"
     options = eligible_pool["strategy"].tolist()
     if selection_key not in st.session_state:
         st.session_state[selection_key] = default_features
@@ -1580,61 +1685,65 @@ def render_final_submission_page(show_tutor: bool) -> None:
     if not st.session_state[selection_key]:
         st.session_state[selection_key] = default_features
 
-    combo_presets = build_top_feature_combo_presets(
-        top_k=int(top_k),
-        min_trades_per_year=float(min_trades),
-        split_ratio=float(split_ratio),
-        ridge_alpha=float(ridge_alpha),
-        gb_rounds=int(gb_rounds),
-        gb_learning_rate=float(gb_lr),
-    )
+    def _apply_proposal_row(row: pd.Series) -> None:
+        chosen_features = [s for s in str(row["features_csv"]).split("|") if s in options]
+        if chosen_features:
+            st.session_state[selection_key] = chosen_features
+        st.session_state["final_submission_top_k"] = int(row["top_k"])
+        st.session_state["final_submission_min_trades"] = float(row["min_trades_per_year"])
+        st.session_state["final_submission_split_ratio"] = float(row["split_ratio"])
+        st.session_state["final_submission_ridge_alpha"] = float(row["ridge_alpha"])
+        st.session_state["final_submission_gb_rounds"] = int(row["gb_rounds"])
+        st.session_state["final_submission_gb_lr"] = float(row["gb_learning_rate"])
+        st.session_state[forced_model_key] = str(row["final_model"])
+        st.session_state[show_fixed_key] = True
 
     with st.sidebar:
         st.markdown("---")
-        st.markdown("### Final Submission Combo Presets")
+        st.markdown("### Best 5 Proposed Strategies (Fixed)")
         st.caption(
-            "Top-5 feature baskets ranked by OOS performance from quarterly Linear Regression + Gradient Boosting Proxy + Ensemble."
+            "Fixed proposals from broad combinations of features and alphas. Use these for client-facing submission candidates."
         )
-        if combo_presets.empty:
-            st.caption("No preset combos available with the current filters.")
-            st.session_state[combo_choice_key] = "Manual basket"
-            st.session_state[combo_applied_key] = "Manual basket"
+        if fixed_proposals.empty:
+            st.caption("No fixed proposals available.")
         else:
-            preset_map = {
-                str(row["preset_label"]): str(row["features_csv"]).split("|")
-                for _, row in combo_presets.iterrows()
-            }
-            combo_options = ["Manual basket"] + list(preset_map.keys())
-            if combo_choice_key not in st.session_state or st.session_state[combo_choice_key] not in combo_options:
-                st.session_state[combo_choice_key] = "Manual basket"
-
-            selected_combo = st.selectbox(
-                "Best feature combinations (Top 5)",
-                options=combo_options,
-                key=combo_choice_key,
-                help="Pick a preset to auto-load its feature basket into the final submission model builder.",
+            proposal_options = fixed_proposals["proposal_label"].astype(str).tolist()
+            if proposal_choice_key not in st.session_state or st.session_state[proposal_choice_key] not in proposal_options:
+                st.session_state[proposal_choice_key] = proposal_options[0]
+            selected_proposal = st.selectbox(
+                "Best 5 submission proposals",
+                options=proposal_options,
+                key=proposal_choice_key,
+                help="Select a fixed proposal and apply it to load its features, model, and alpha settings.",
             )
+            selected_row = fixed_proposals[fixed_proposals["proposal_label"] == selected_proposal].iloc[0]
 
-            if selected_combo != "Manual basket" and st.session_state.get(combo_applied_key) != selected_combo:
-                chosen = [s for s in preset_map.get(selected_combo, []) if s in options]
-                if chosen:
-                    st.session_state[selection_key] = chosen
-                st.session_state[combo_applied_key] = selected_combo
-            if selected_combo == "Manual basket":
-                st.session_state[combo_applied_key] = "Manual basket"
+            if st.button("Apply Selected Proposed Strategy", key="final_submission_apply_fixed_choice"):
+                _apply_proposal_row(selected_row)
+                st.session_state[proposal_applied_key] = selected_proposal
+                st.rerun()
 
-            with st.expander("View Top 5 combinations", expanded=False):
+            if st.button("Apply Best Of Best (Top 1)", key="final_submission_apply_fixed_top1"):
+                _apply_proposal_row(fixed_proposals.iloc[0])
+                st.session_state[proposal_applied_key] = str(fixed_proposals.iloc[0]["proposal_label"])
+                st.rerun()
+
+            with st.expander("View fixed top 5", expanded=False):
                 st.dataframe(
-                    combo_presets[
+                    fixed_proposals[
                         [
                             "rank",
+                            "final_model",
+                            "feature_count",
+                            "split_ratio",
+                            "ridge_alpha",
+                            "gb_rounds",
+                            "gb_learning_rate",
                             "features_display",
-                            "mean_oos_ann_return",
-                            "mean_oos_sharpe",
-                            "beat_rate",
-                            "lr_oos_ann_return",
-                            "gb_oos_ann_return",
-                            "ens_oos_ann_return",
+                            "out_sample_ann_return",
+                            "out_sample_sharpe",
+                            "oos_excess_ann_return_vs_brent",
+                            "beats_brent_oos",
                         ]
                     ].round(4),
                     use_container_width=True,
@@ -1643,8 +1752,7 @@ def render_final_submission_page(show_tutor: bool) -> None:
 
     if st.button("Reset Basket To Default Top 3"):
         st.session_state[selection_key] = default_features
-        st.session_state[combo_choice_key] = "Manual basket"
-        st.session_state[combo_applied_key] = "Manual basket"
+        st.session_state.pop(forced_model_key, None)
 
     selected_features = st.multiselect(
         "Add or remove features for the final strategy submission",
@@ -1707,7 +1815,13 @@ def render_final_submission_page(show_tutor: bool) -> None:
     if not model_options:
         st.warning("No model outputs available for final strategy selection.")
         return
-    default_model = "Ensemble (Quarterly Rebalanced OOS)" if "Ensemble (Quarterly Rebalanced OOS)" in model_options else model_options[0]
+    forced_model = str(st.session_state.get(forced_model_key, ""))
+    if forced_model in model_options:
+        default_model = forced_model
+    elif "Ensemble (Quarterly Rebalanced OOS)" in model_options:
+        default_model = "Ensemble (Quarterly Rebalanced OOS)"
+    else:
+        default_model = model_options[0]
     final_model = st.selectbox(
         "Final strategy model",
         options=model_options,

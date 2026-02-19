@@ -22,6 +22,7 @@ class HardFilterConfig:
     max_flat_period_days: int = 252
     min_parameter_stability: float = 0.28
     max_surface_gradient: float = 7.5
+    reject_for_missing_logic: bool = True
 
 
 def _safe_div(a: float, b: float) -> float:
@@ -271,11 +272,13 @@ def apply_hard_filters(diagnostics_df: pd.DataFrame, cfg: HardFilterConfig | Non
             flags.append("IS_OOS_GAP")
             reject_reasons.append("Walk-forward inconsistency")
 
-        if not str(row.get("economic_hypothesis", "")).strip() or not str(
-            row.get("supporting_statistical_evidence", "")
-        ).strip():
+        missing_logic = (not str(row.get("economic_hypothesis", "")).strip()) or (
+            not str(row.get("supporting_statistical_evidence", "")).strip()
+        )
+        if missing_logic:
             flags.append("MISSING_LOGIC_DOC")
-            reject_reasons.append("No economic logic")
+            if cfg.reject_for_missing_logic:
+                reject_reasons.append("No economic logic")
 
         red_flags.append(", ".join(flags) if flags else "NONE")
         reasons.append(", ".join(dict.fromkeys(reject_reasons)) if reject_reasons else "NONE")

@@ -52,6 +52,7 @@ class SurvivalConfig:
     w_regime_diversification: float = 0.18
     min_trades_per_year: float = 4.0
     max_corr_keep: float = 0.95
+    reject_for_missing_logic: bool = True
 
 
 def _clip01(x: float) -> float:
@@ -542,6 +543,7 @@ def run_survival_framework(
         diagnostics,
         HardFilterConfig(
             trades_per_year_min=survival_cfg.min_trades_per_year,
+            reject_for_missing_logic=survival_cfg.reject_for_missing_logic,
         ),
     )
     diagnostics = _build_final_score(diagnostics, survival_cfg).sort_values("final_robustness_score", ascending=False)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import warnings
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -16,6 +16,7 @@ from research_engine import (
     build_strategy_library,
     compute_metrics,
     detect_regimes,
+    evaluate_strategy_library,
     generate_feature_library,
     load_price_data,
     run_research,
@@ -376,6 +377,16 @@ def strategy_one_liner(strategy: str) -> str:
     if s.startswith("ml_linear_thr_"):
         _, _, _, w, thr = s.split("_")
         return f"Thresholded linear score ({w}d, thr {thr}): only takes trades when composite score conviction exceeds threshold."
+    if s.startswith("time_based_"):
+        return "Time-based rule from Survival Mode: uses calendar structure (month/day/event timing) to set directional exposure."
+    if s.startswith("vol_based_"):
+        return "Volatility-conditioned rule from Survival Mode: behavior changes when realized volatility enters stress/calm states."
+    if s.startswith("regime_"):
+        return "Regime-switching rule from Survival Mode: toggles between trend/reversion logic by detected market state."
+    if s.startswith("stat_"):
+        return "Statistical-state rule from Survival Mode: trades based on distribution shape, z-scores, or shift diagnostics."
+    if s.startswith("ml_light_"):
+        return "Interpretable ML-light rule from Survival Mode using linear/logistic/tree-vote style predictors."
     return "Rule-based strategy from the research factory; inspect KPIs and charts below for behavior details."
 
 
@@ -399,7 +410,7 @@ def load_output_tables() -> Dict[str, pd.DataFrame]:
 
 
 @st.cache_data(show_spinner=True)
-def build_universe() -> Tuple[pd.Series, pd.Series, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def build_universe() -> Tuple[pd.Series, pd.Series, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     cfg = ResearchConfig()
     close, rets = load_price_data(cfg)
     with warnings.catch_warnings():
@@ -408,16 +419,17 @@ def build_universe() -> Tuple[pd.Series, pd.Series, pd.DataFrame, pd.DataFrame, 
     pnl_df, signal_df, family_map = build_strategy_library(close, rets, features, cfg)
     family_df = pd.Series(family_map, name="family").to_frame()
     regimes = detect_regimes(features)
-    return close, rets, pnl_df, signal_df, family_df.join(regimes, how="left")
+    return close, rets, pnl_df, signal_df, family_df, regimes
 
 
 @st.cache_data(show_spinner=True)
-def load_survival_layer() -> Dict[str, object]:
-    return run_survival_framework(ResearchConfig(), SurvivalConfig())
+def load_survival_layer(reject_for_missing_logic: bool = True) -> Dict[str, object]:
+    cfg = SurvivalConfig(reject_for_missing_logic=reject_for_missing_logic)
+    return run_survival_framework(ResearchConfig(), cfg)
 
 
-def render_survival_mode(show_tutor: bool) -> None:
-    payload = load_survival_layer()
+def render_survival_mode(show_tutor: bool, reject_for_missing_logic: bool) -> None:
+    payload = load_survival_layer(reject_for_missing_logic=reject_for_missing_logic)
     diagnostics = payload["diagnostics"].copy()
     pnl_df = payload["pnl_df"]
     signal_df = payload["signal_df"]
@@ -431,7 +443,8 @@ def render_survival_mode(show_tutor: bool) -> None:
     blending = payload["blending"]
 
     st.subheader("Quant Robustness & Survival Framework v2")
-    st.caption("Survival-first validation: reject fragile ideas, then rank what survives.")
+    profile_label = "Strict profile (economic-logic rejection ON)" if reject_for_missing_logic else "Statistical profile (economic-logic rejection OFF)"
+    st.caption(f"Survival-first validation: reject fragile ideas, then rank what survives. Active filter profile: {profile_label}.")
 
     tabs = st.tabs(
         [
@@ -673,9 +686,10 @@ def render_survival_mode(show_tutor: bool) -> None:
         section_header(
             "Strategy Graveyard",
             "Rejected strategies are logged with explicit reasons.",
-            "Auto-generated rejection report with strict hard-filter reasons for auditability.",
+            "Auto-generated rejection report with hard-filter reasons for auditability.",
             show_tutor,
         )
+        st.caption(f"Current rejection profile: `{profile_label}`")
         if graveyard.empty:
             st.success("No strategies rejected by current hard filters.")
         else:
@@ -732,6 +746,416 @@ def build_hero_table(frame: pd.DataFrame, score_col: str) -> pd.DataFrame:
     ]
     out = valid.loc[idx, cols].sort_values(score_col, ascending=False).reset_index(drop=True)
     return out
+
+
+def combine_strategy_universe(
+    base_pnl: pd.DataFrame,
+    base_signal: pd.DataFrame,
+    base_family_df: pd.DataFrame,
+    include_survival_universe: bool,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if not include_survival_universe:
+        fam = base_family_df.reindex(base_pnl.columns).copy()
+        fam["family"] = fam["family"].fillna("unknown")
+        return base_pnl.copy(), base_signal.copy(), fam
+
+    payload = load_survival_layer(reject_for_missing_logic=False)
+    surv_pnl = payload["pnl_df"].copy()
+    surv_signal = payload["signal_df"].copy()
+    surv_family = (
+        payload["diagnostics"][["strategy", "family"]]
+        .dropna(subset=["strategy"])
+        .drop_duplicates(subset=["strategy"])
+        .set_index("strategy")
+    )
+
+    pnl_df = pd.concat([base_pnl, surv_pnl], axis=1)
+    pnl_df = pnl_df.loc[:, ~pnl_df.columns.duplicated(keep="first")]
+    signal_df = pd.concat([base_signal, surv_signal], axis=1)
+    signal_df = signal_df.loc[:, ~signal_df.columns.duplicated(keep="first")]
+    signal_df = signal_df.reindex(columns=pnl_df.columns).fillna(0.0)
+
+    family_df = pd.concat([base_family_df, surv_family], axis=0)
+    family_df = family_df[~family_df.index.duplicated(keep="first")]
+    family_df = family_df.reindex(pnl_df.columns).copy()
+    family_df["family"] = family_df["family"].fillna("unknown")
+    return pnl_df, signal_df, family_df
+
+
+def build_metrics_table(
+    pnl_df: pd.DataFrame,
+    signal_df: pd.DataFrame,
+    family_df: pd.DataFrame,
+) -> pd.DataFrame:
+    family_map = family_df["family"].to_dict()
+    metrics_df = evaluate_strategy_library(pnl_df, signal_df, family_map).copy()
+    trade_df = universe_trade_stats(signal_df).reset_index()
+
+    for col in [
+        "trade_events_total",
+        "trade_day_pct",
+        "turnover_units_total",
+        "active_day_pct",
+        "years_with_trades",
+        "trades_per_year",
+        "trade_weight",
+    ]:
+        if col in metrics_df.columns:
+            metrics_df = metrics_df.drop(columns=col)
+
+    metrics_df = metrics_df.merge(trade_df, on="strategy", how="left")
+    metrics_df["activity_adjusted_sharpe"] = metrics_df["sharpe"] * metrics_df["trade_weight"]
+    metrics_df["family"] = metrics_df["family"].fillna("unknown")
+    return metrics_df
+
+
+def _fit_ridge_beta(x: np.ndarray, y: np.ndarray, alpha: float) -> np.ndarray:
+    p = x.shape[1]
+    return np.linalg.pinv(x.T @ x + alpha * np.eye(p)) @ (x.T @ y)
+
+
+def _fit_gradient_boosting_proxy(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    n_rounds: int,
+    learning_rate: float,
+) -> Tuple[float, List[Tuple[int, float]]]:
+    base = float(np.nanmean(y_train))
+    pred = np.full(len(y_train), base, dtype=float)
+    components: List[Tuple[int, float]] = []
+
+    for _ in range(int(max(n_rounds, 1))):
+        residual = y_train - pred
+        best_j = -1
+        best_coef = 0.0
+        best_score = 0.0
+        for j in range(x_train.shape[1]):
+            col = x_train[:, j]
+            denom = float(np.dot(col, col) + 1e-12)
+            coef = float(np.dot(col, residual) / denom)
+            score = abs(coef) * float(np.std(col))
+            if score > best_score:
+                best_score = score
+                best_j = j
+                best_coef = coef
+        if best_j < 0:
+            break
+        step = float(learning_rate) * best_coef
+        pred = pred + step * x_train[:, best_j]
+        components.append((best_j, step))
+
+    return base, components
+
+
+def _predict_gradient_boosting_proxy(x: np.ndarray, base: float, components: List[Tuple[int, float]]) -> np.ndarray:
+    pred = np.full(x.shape[0], base, dtype=float)
+    for j, w in components:
+        pred = pred + w * x[:, int(j)]
+    return pred
+
+
+def _selection_score(series: pd.Series) -> pd.Series:
+    s = series.astype(float)
+    return (s - s.mean()) / (s.std() + 1e-12)
+
+
+def _summarize_submission_model(
+    name: str,
+    pnl: pd.Series,
+    signal: pd.Series,
+    split_idx: int,
+) -> Dict[str, float]:
+    full = compute_metrics(pnl, signal)
+    ins = compute_metrics(pnl.iloc[:split_idx], signal.iloc[:split_idx])
+    oos = compute_metrics(pnl.iloc[split_idx:], signal.iloc[split_idx:])
+    trades_total = float((signal.diff().abs().fillna(0.0) > 1e-12).sum())
+    n_years = max(int(signal.index.year.nunique()), 1)
+    consistency = 1.0 if np.sign(ins["sharpe"]) == np.sign(oos["sharpe"]) else 0.0
+    return {
+        "model": name,
+        "full_sample_sharpe": float(full["sharpe"]),
+        "in_sample_sharpe": float(ins["sharpe"]),
+        "out_sample_sharpe": float(oos["sharpe"]),
+        "full_sample_ann_return": float(full["ann_return"]),
+        "out_sample_ann_return": float(oos["ann_return"]),
+        "full_sample_max_drawdown": float(full["max_drawdown"]),
+        "out_sample_max_drawdown": float(oos["max_drawdown"]),
+        "trades_total": trades_total,
+        "trades_per_year": trades_total / n_years,
+        "consistency_index": consistency,
+    }
+
+
+@st.cache_data(show_spinner=True)
+def build_final_submission_payload(
+    top_k: int,
+    min_trades_per_year: float,
+    split_ratio: float,
+    ridge_alpha: float,
+    gb_rounds: int,
+    gb_learning_rate: float,
+) -> Dict[str, object]:
+    payload = load_survival_layer(reject_for_missing_logic=False)
+    diagnostics = payload["diagnostics"].copy()
+    signal_df = payload["signal_df"].copy()
+    rets = payload["returns"].copy()
+    tcost = ResearchConfig().tcost
+
+    diagnostics["sample_sharpe"] = diagnostics["out_sample_sharpe"].fillna(diagnostics["sharpe"])
+    diagnostics["selection_score"] = (
+        0.50 * _selection_score(diagnostics["sample_sharpe"])
+        + 0.35 * diagnostics["consistency_index"].fillna(0.0)
+        + 0.15 * _selection_score(diagnostics["trades_per_year"].fillna(0.0))
+    )
+    eligible = diagnostics[diagnostics["trades_per_year"].fillna(0.0) >= float(min_trades_per_year)].copy()
+    eligible = eligible.sort_values("selection_score", ascending=False).reset_index(drop=True)
+
+    selected = eligible.head(int(max(1, top_k))).copy()
+    selected_features = selected["strategy"].tolist()
+    if not selected_features:
+        return {
+            "error": f"No strategies satisfy trades/year >= {min_trades_per_year}. Lower the threshold.",
+            "eligible": eligible,
+        }
+
+    x = signal_df[selected_features].fillna(0.0).copy()
+    y = rets.shift(-1).fillna(0.0).reindex(x.index)
+    split_idx = int(len(x) * float(split_ratio))
+    split_idx = min(max(split_idx, 252), max(len(x) - 5, 1))
+
+    x_train = x.iloc[:split_idx]
+    mu = x_train.mean()
+    sd = x_train.std().replace(0.0, 1.0)
+    x_std = ((x - mu) / sd).fillna(0.0)
+
+    x_train_np = x_std.iloc[:split_idx].to_numpy()
+    y_train_np = y.iloc[:split_idx].to_numpy()
+    beta = _fit_ridge_beta(x_train_np, y_train_np, alpha=float(ridge_alpha))
+    ridge_score = pd.Series(x_std.to_numpy() @ beta, index=x.index, name="ridge_score")
+
+    gb_base, gb_components = _fit_gradient_boosting_proxy(
+        x_train_np,
+        y_train_np,
+        n_rounds=int(gb_rounds),
+        learning_rate=float(gb_learning_rate),
+    )
+    gb_score = pd.Series(
+        _predict_gradient_boosting_proxy(x_std.to_numpy(), gb_base, gb_components),
+        index=x.index,
+        name="gb_score",
+    )
+
+    def score_to_signal(score: pd.Series) -> pd.Series:
+        scale = float(score.iloc[:split_idx].std())
+        scale = max(scale, 1e-6)
+        return pd.Series(np.tanh(score / scale), index=score.index)
+
+    ridge_signal = score_to_signal(ridge_score)
+    gb_signal = score_to_signal(gb_score)
+    ensemble_signal = 0.5 * ridge_signal + 0.5 * gb_signal
+    eq_signal = x.mean(axis=1).clip(-1.0, 1.0)
+
+    def signal_to_pnl(signal: pd.Series) -> pd.Series:
+        turnover = signal.diff().abs().fillna(0.0)
+        return signal * y - float(tcost) * turnover
+
+    pnl_map = {
+        "Linear Regression": signal_to_pnl(ridge_signal).rename("linear_regression"),
+        "Gradient Boosting Proxy": signal_to_pnl(gb_signal).rename("gradient_boosting_proxy"),
+        "Ensemble (50/50)": signal_to_pnl(ensemble_signal).rename("ensemble_50_50"),
+        "Equal-Weight Feature Blend": signal_to_pnl(eq_signal).rename("equal_weight_features"),
+        "Buy & Hold Brent": y.rename("buy_hold_brent"),
+    }
+    signal_map = {
+        "Linear Regression": ridge_signal.rename("linear_regression_signal"),
+        "Gradient Boosting Proxy": gb_signal.rename("gradient_boosting_proxy_signal"),
+        "Ensemble (50/50)": ensemble_signal.rename("ensemble_signal"),
+        "Equal-Weight Feature Blend": eq_signal.rename("equal_weight_feature_signal"),
+    }
+
+    model_rows = []
+    for model_name in ["Linear Regression", "Gradient Boosting Proxy", "Ensemble (50/50)", "Equal-Weight Feature Blend"]:
+        model_rows.append(
+            _summarize_submission_model(
+                model_name,
+                pnl_map[model_name],
+                signal_map[model_name],
+                split_idx=split_idx,
+            )
+        )
+    model_table = pd.DataFrame(model_rows).sort_values("out_sample_sharpe", ascending=False).reset_index(drop=True)
+
+    linear_coef = (
+        pd.DataFrame({"feature": x.columns, "coefficient": beta})
+        .assign(abs_coef=lambda d: d["coefficient"].abs())
+        .sort_values("abs_coef", ascending=False)
+        .drop(columns=["abs_coef"])
+        .reset_index(drop=True)
+    )
+
+    boost_rows = []
+    for round_id, (j, w) in enumerate(gb_components, start=1):
+        boost_rows.append({"round": round_id, "feature": x.columns[int(j)], "step_weight": float(w)})
+    boost_df = pd.DataFrame(boost_rows)
+    if not boost_df.empty:
+        boost_summary = (
+            boost_df.groupby("feature", as_index=False)
+            .agg(rounds_used=("round", "count"), cumulative_weight=("step_weight", "sum"))
+            .assign(abs_weight=lambda d: d["cumulative_weight"].abs())
+            .sort_values("abs_weight", ascending=False)
+            .drop(columns=["abs_weight"])
+            .reset_index(drop=True)
+        )
+    else:
+        boost_summary = pd.DataFrame(columns=["feature", "rounds_used", "cumulative_weight"])
+
+    variable_glossary = pd.DataFrame(
+        [
+            {"variable": "selection_top_k", "value": int(top_k), "description": "Number of features selected (5-10 requested)."},
+            {"variable": "min_trades_per_year", "value": float(min_trades_per_year), "description": "Minimum trade intensity filter."},
+            {"variable": "sample_sharpe", "value": "out_sample_sharpe (fallback sharpe)", "description": "Primary quality metric in ranking."},
+            {"variable": "consistency_index", "value": "0/1 from IS/OOS Sharpe sign match", "description": "Stability term in feature ranking."},
+            {"variable": "selection_score", "value": "0.50*z(sample_sharpe)+0.35*consistency+0.15*z(trades_per_year)", "description": "Feature ranking formula."},
+            {"variable": "split_ratio", "value": float(split_ratio), "description": "Chronological train/test split for model fitting."},
+            {"variable": "ridge_alpha", "value": float(ridge_alpha), "description": "L2 regularization strength in linear regression."},
+            {"variable": "gb_rounds", "value": int(gb_rounds), "description": "Boosting iterations in the proxy gradient booster."},
+            {"variable": "gb_learning_rate", "value": float(gb_learning_rate), "description": "Step size for each boosting round."},
+            {"variable": "transaction_cost", "value": float(tcost), "description": "Cost applied per unit signal change."},
+            {"variable": "target", "value": "next_day_return", "description": "Model predicts next-day Brent return."},
+            {"variable": "signal_transform", "value": "tanh(score/std_train)", "description": "Maps model score to [-1, 1] position size."},
+        ]
+    )
+
+    selected_cols = [
+        "strategy",
+        "family",
+        "sample_sharpe",
+        "sharpe",
+        "consistency_index",
+        "trades_per_year",
+        "selection_score",
+        "final_robustness_score",
+        "OVERFIT_RISK",
+    ]
+    selected_view = selected[selected_cols].copy()
+    eligible_view = eligible[selected_cols].copy()
+
+    return {
+        "error": "",
+        "selected_features": selected_features,
+        "selected_table": selected_view,
+        "eligible_table": eligible_view,
+        "model_table": model_table,
+        "linear_coefficients": linear_coef,
+        "boosting_summary": boost_summary,
+        "variable_glossary": variable_glossary,
+        "pnl_map": pnl_map,
+        "signal_map": signal_map,
+        "split_idx": int(split_idx),
+        "returns_target": y,
+    }
+
+
+def render_final_submission_page(show_tutor: bool) -> None:
+    section_header(
+        "Final Submission Strategy Builder",
+        "Select robust features, fit transparent models, and publish one final strategy.",
+        "Feature-screened meta-model construction (linear + boosting proxy) with full variable audit.",
+        show_tutor,
+    )
+
+    st.markdown(
+        "This page is submission-oriented: it enforces your constraints (sample Sharpe, consistency, trades/year >= 20), "
+        "fits model-based final strategies, and documents every variable used."
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    top_k = c1.slider("Top features to select", min_value=5, max_value=10, value=7, step=1)
+    min_trades = c2.number_input("Minimum trades/year filter", min_value=1.0, max_value=100.0, value=20.0, step=1.0)
+    split_ratio = c3.slider("Train ratio", min_value=0.60, max_value=0.85, value=0.70, step=0.05)
+    final_model = c4.selectbox(
+        "Final strategy model",
+        options=["Ensemble (50/50)", "Linear Regression", "Gradient Boosting Proxy", "Equal-Weight Feature Blend"],
+        index=0,
+    )
+
+    m1, m2 = st.columns(2)
+    ridge_alpha = m1.number_input("Ridge alpha", min_value=0.1, max_value=20.0, value=4.0, step=0.1)
+    gb_rounds = int(m2.slider("Boosting rounds", min_value=20, max_value=200, value=80, step=10))
+    gb_lr = st.slider("Boosting learning rate", min_value=0.01, max_value=0.50, value=0.08, step=0.01)
+
+    bundle = build_final_submission_payload(
+        top_k=int(top_k),
+        min_trades_per_year=float(min_trades),
+        split_ratio=float(split_ratio),
+        ridge_alpha=float(ridge_alpha),
+        gb_rounds=int(gb_rounds),
+        gb_learning_rate=float(gb_lr),
+    )
+
+    if bundle.get("error"):
+        st.warning(str(bundle["error"]))
+        if "eligible" in bundle and isinstance(bundle["eligible"], pd.DataFrame):
+            st.dataframe(bundle["eligible"], use_container_width=True, hide_index=True)
+        return
+
+    st.markdown("### Feature Selection Results")
+    st.caption(
+        "Ranking formula: selection_score = 0.50*z(sample_sharpe) + 0.35*consistency_index + 0.15*z(trades_per_year), "
+        "with hard filter trades_per_year >= min threshold."
+    )
+    st.markdown(f"**Selected features ({len(bundle['selected_features'])}):** `{', '.join(bundle['selected_features'])}`")
+    st.dataframe(bundle["selected_table"].round(4), use_container_width=True, hide_index=True)
+
+    with st.expander("See full eligible feature pool", expanded=False):
+        st.dataframe(bundle["eligible_table"].round(4), use_container_width=True, hide_index=True)
+
+    st.markdown("### Model Inputs, Variables, and Hyperparameters")
+    st.dataframe(bundle["variable_glossary"], use_container_width=True, hide_index=True)
+
+    v1, v2 = st.columns(2)
+    with v1:
+        st.markdown("**Linear Regression Coefficients**")
+        st.dataframe(bundle["linear_coefficients"].round(6), use_container_width=True, hide_index=True)
+    with v2:
+        st.markdown("**Gradient Boosting Proxy Feature Contributions**")
+        st.dataframe(bundle["boosting_summary"].round(6), use_container_width=True, hide_index=True)
+
+    st.markdown("### Model Performance (Full Sample + IS/OOS)")
+    st.dataframe(bundle["model_table"].round(4), use_container_width=True, hide_index=True)
+
+    final_pnl = bundle["pnl_map"][final_model]
+    final_signal = bundle["signal_map"][final_model]
+    target_rets = bundle["returns_target"]
+    split_idx = int(bundle["split_idx"])
+
+    kpis = extended_kpis(final_pnl, final_signal)
+    st.markdown(f"### Final Strategy KPI Scorecard: `{final_model}`")
+    show_kpi_tiles(kpis, show_tutor=show_tutor)
+
+    compare = pd.DataFrame(
+        {
+            "Final Strategy": (1.0 + final_pnl.fillna(0.0)).cumprod(),
+            "Buy & Hold Brent": (1.0 + target_rets.fillna(0.0)).cumprod(),
+            "Linear Regression": (1.0 + bundle["pnl_map"]["Linear Regression"].fillna(0.0)).cumprod(),
+            "Gradient Boosting Proxy": (1.0 + bundle["pnl_map"]["Gradient Boosting Proxy"].fillna(0.0)).cumprod(),
+        },
+        index=final_pnl.index,
+    )
+    fig = px.line(compare.reset_index(), x="date", y=compare.columns.tolist(), title="Final Strategy vs Benchmarks")
+    fig.add_vline(x=compare.index[min(split_idx, len(compare.index) - 1)], line_dash="dash", annotation_text="Train/Test Split")
+    st.plotly_chart(fig, use_container_width=True)
+
+    is_oos = pd.DataFrame(
+        [
+            {"segment": "In Sample", "sharpe": compute_metrics(final_pnl.iloc[:split_idx], final_signal.iloc[:split_idx])["sharpe"]},
+            {"segment": "Out of Sample", "sharpe": compute_metrics(final_pnl.iloc[split_idx:], final_signal.iloc[split_idx:])["sharpe"]},
+        ]
+    )
+    st.plotly_chart(px.bar(is_oos, x="segment", y="sharpe", title="Final Strategy IS vs OOS Sharpe"), use_container_width=True)
+
+    st.markdown("### Yearly Final Strategy Breakdown")
+    st.dataframe(yearly_breakdown(final_pnl, final_signal).round(4), use_container_width=True, hide_index=True)
 
 
 def show_kpi_tiles(kpis: Dict[str, float], show_tutor: bool) -> None:
@@ -801,35 +1225,7 @@ def main() -> None:
     )
 
     tables = load_output_tables()
-    close, rets, pnl_df, signal_df, tags_df = build_universe()
-
-    metrics_df = tables["strategy_metrics"].copy()
-    if "family" not in metrics_df.columns:
-        if "family_x" in metrics_df.columns or "family_y" in metrics_df.columns:
-            left = metrics_df["family_x"] if "family_x" in metrics_df.columns else pd.Series(index=metrics_df.index)
-            right = metrics_df["family_y"] if "family_y" in metrics_df.columns else pd.Series(index=metrics_df.index)
-            metrics_df["family"] = left.fillna(right)
-        else:
-            metrics_df = metrics_df.merge(tags_df[["family"]], left_on="strategy", right_index=True, how="left")
-
-    # Backfill missing family tags from live strategy map when needed.
-    fill_map = tags_df["family"].to_dict()
-    metrics_df["family"] = metrics_df["family"].fillna(metrics_df["strategy"].map(fill_map))
-
-    trade_df = universe_trade_stats(signal_df).reset_index()
-    for col in [
-        "trade_events_total",
-        "trade_day_pct",
-        "turnover_units_total",
-        "active_day_pct",
-        "years_with_trades",
-        "trades_per_year",
-        "trade_weight",
-    ]:
-        if col in metrics_df.columns:
-            metrics_df = metrics_df.drop(columns=col)
-    metrics_df = metrics_df.merge(trade_df, on="strategy", how="left")
-    metrics_df["activity_adjusted_sharpe"] = metrics_df["sharpe"] * metrics_df["trade_weight"]
+    close, rets, base_pnl_df, base_signal_df, base_family_df, regimes_df = build_universe()
 
     benchmark = rets.fillna(0.0)
     benchmark_kpi = extended_kpis(benchmark, pd.Series(1.0, index=benchmark.index))
@@ -847,7 +1243,21 @@ def main() -> None:
             value=True,
             help="Turn on plain-language explanations without removing advanced analytics.",
         )
+        survival_profile = "Strict (reject missing economic logic)"
+        include_survival_universe = True
         if system_mode == "Discovery Mode":
+            include_survival_universe = st.checkbox(
+                "Include Survival strategy universe",
+                value=True,
+                help="Adds Survival-Mode generated strategies into Strategy Explorer and Cross-Compare.",
+            )
+            pnl_df, signal_df, family_df = combine_strategy_universe(
+                base_pnl_df,
+                base_signal_df,
+                base_family_df,
+                include_survival_universe=include_survival_universe,
+            )
+            metrics_df = build_metrics_table(pnl_df, signal_df, family_df)
             family_filter = st.multiselect(
                 "Filter families",
                 options=sorted(metrics_df["family"].dropna().unique().tolist()),
@@ -890,12 +1300,25 @@ def main() -> None:
                     enabled=True,
                 )
         else:
+            survival_profile = st.radio(
+                "Survival filter profile",
+                options=[
+                    "Strict (reject missing economic logic)",
+                    "Statistical-only (do not reject missing economic logic)",
+                ],
+                index=0,
+                help="Strict mode rejects undocumented ideas; statistical-only mode keeps them and only flags them.",
+            )
             st.info(
                 "Survival Mode is active: hard filters, rejection engine, parameter surfaces, walk-forward survival, and feature blending lab."
             )
 
     if system_mode == "Survival Mode":
-        render_survival_mode(show_tutor=show_tutor)
+        reject_missing_logic = survival_profile.startswith("Strict")
+        render_survival_mode(show_tutor=show_tutor, reject_for_missing_logic=reject_missing_logic)
+        return
+
+    if system_mode != "Discovery Mode":
         return
 
     filtered = metrics_df[metrics_df["family"].isin(family_filter)].copy()
@@ -905,7 +1328,7 @@ def main() -> None:
         return
 
     tabs = st.tabs(
-        ["Universe Overview", "Strategy Explorer", "Cross-Compare", "Walkforward & Robustness"]
+        ["Universe Overview", "Strategy Explorer", "Cross-Compare", "Walkforward & Robustness", "Final Submission Strategy"]
     )
 
     with tabs[0]:
@@ -1182,7 +1605,7 @@ def main() -> None:
                     True,
                 )
 
-        reg = tags_df[["volatility_regime", "trend_regime", "autocorr_regime", "hurst_regime"]].copy()
+        reg = regimes_df[["volatility_regime", "trend_regime", "autocorr_regime", "hurst_regime"]].copy()
         reg = reg.join(ts["returns"])
         section_header(
             "Regime Performance",
@@ -1458,6 +1881,9 @@ def main() -> None:
             show_tutor,
         )
         st.dataframe(tables["ensemble_metrics"], use_container_width=True, hide_index=True)
+
+    with tabs[4]:
+        render_final_submission_page(show_tutor=show_tutor)
 
 
 if __name__ == "__main__":

@@ -141,6 +141,26 @@ FAMILY_EXPLAINERS = {
         "Combines many features into a score and maps score to trade direction.",
         "Linear composite signal with thresholded decision boundaries.",
     ),
+    "time_series": (
+        "Classical time-series rules that use persistence, trend strength, and adaptive momentum.",
+        "Signals from multi-horizon momentum agreement, EWMA edge, and drawdown/volatility gates.",
+    ),
+    "event_flow": (
+        "Event-window logic around month/quarter timing and weekday flow effects.",
+        "Calendar-event conditioned directional rules, including quarter-turn and turn-of-month structures.",
+    ),
+    "microstructure_proxy": (
+        "Short-horizon behavior proxies for bounce, reversal, and post-shock reactions.",
+        "Lag-return pattern rules and volatility-conditioned short-term state transitions.",
+    ),
+    "time_series_adaptive": (
+        "Adaptive time-series models that blend fast and slow trend persistence.",
+        "Dual-horizon momentum agreement plus EWMA risk-adjusted edge signals.",
+    ),
+    "risk_overlay": (
+        "Risk-budget overlays that dynamically scale exposure by volatility and drawdown.",
+        "Vol-target and drawdown cutback overlays applied on directional base signals.",
+    ),
 }
 
 
@@ -377,6 +397,28 @@ def strategy_one_liner(strategy: str) -> str:
     if s.startswith("ml_linear_thr_"):
         _, _, _, w, thr = s.split("_")
         return f"Thresholded linear score ({w}d, thr {thr}): only takes trades when composite score conviction exceeds threshold."
+    if s.startswith("ts_dual_mom_"):
+        _, _, _, fast, slow = s.split("_")
+        return f"Time-series dual momentum ({fast}/{slow}d): trades only when fast and slow trend directions agree."
+    if s.startswith("ts_ewm_edge_"):
+        w = s.split("_")[-1]
+        return f"EWMA edge model ({w}d): position size follows exponentially weighted mean/volatility edge."
+    if s.startswith("ts_strength_"):
+        _, _, w, thr = s.split("_")
+        return f"Trend-strength gate ({w}d, thr {thr}): trades only when normalized trend strength is strong enough."
+    if s.startswith("ts_drawdown_vol_gate_"):
+        w = s.split("_")[-1]
+        return f"Drawdown-volatility gated trend ({w}d): trend trades are muted during deep drawdown or stressed volatility."
+    if s.startswith("time_series_adaptive_"):
+        return "Adaptive time-series rule from Survival Mode using multi-horizon persistence signals."
+    if s.startswith("event_flow_"):
+        return "Event-flow rule from Survival Mode using quarter/month timing windows."
+    if s.startswith("risk_overlay_"):
+        return "Risk-overlay rule from Survival Mode applying volatility/drawdown-aware position scaling."
+    if s.startswith("event_"):
+        return "Event-flow strategy: calendar/event window logic conditions directional exposure."
+    if s.startswith("micro_"):
+        return "Microstructure-proxy strategy: short-horizon lag and shock patterns drive tactical positioning."
     if s.startswith("time_based_"):
         return "Time-based rule from Survival Mode: uses calendar structure (month/day/event timing) to set directional exposure."
     if s.startswith("vol_based_"):
@@ -392,8 +434,8 @@ def strategy_one_liner(strategy: str) -> str:
 
 @st.cache_data(show_spinner=False)
 def load_output_tables() -> Dict[str, pd.DataFrame]:
-    if not OUTPUT_DIR.exists() or not (OUTPUT_DIR / "strategy_metrics.csv").exists():
-        run_research(ResearchConfig())
+    # Rebuild outputs to keep walkforward/robustness tables synced with the live strategy factory.
+    run_research(ResearchConfig())
 
     tables = {
         "strategy_metrics": pd.read_csv(OUTPUT_DIR / "strategy_metrics.csv"),
@@ -859,6 +901,52 @@ def _selection_score(series: pd.Series) -> pd.Series:
     return (s - s.mean()) / (s.std() + 1e-12)
 
 
+def _pick_family_diverse_defaults(
+    eligible: pd.DataFrame,
+    score_col: str,
+    top_n: int,
+) -> List[str]:
+    if eligible.empty or score_col not in eligible.columns:
+        return []
+    ranked = eligible.sort_values([score_col, "selection_score"], ascending=False).reset_index(drop=True)
+    picks: List[str] = []
+    used_families = set()
+    for _, row in ranked.iterrows():
+        strategy = str(row["strategy"])
+        family = str(row["family"])
+        if family in used_families:
+            continue
+        picks.append(strategy)
+        used_families.add(family)
+        if len(picks) >= int(top_n):
+            break
+    if len(picks) < int(top_n):
+        extras = [str(x) for x in ranked["strategy"].tolist() if str(x) not in picks]
+        picks.extend(extras[: max(int(top_n) - len(picks), 0)])
+    return picks
+
+
+@st.cache_data(show_spinner=False)
+def build_submission_feature_pool(min_trades_per_year: float) -> Dict[str, object]:
+    payload = load_survival_layer(reject_for_missing_logic=False)
+    diagnostics = payload["diagnostics"].copy()
+    diagnostics["sample_sharpe"] = diagnostics["out_sample_sharpe"].fillna(diagnostics["sharpe"])
+    diagnostics["walkforward_ann_return"] = diagnostics["out_sample_cagr"].fillna(diagnostics["ann_return"])
+    diagnostics["selection_score"] = (
+        0.50 * _selection_score(diagnostics["sample_sharpe"])
+        + 0.35 * diagnostics["consistency_index"].fillna(0.0)
+        + 0.15 * _selection_score(diagnostics["trades_per_year"].fillna(0.0))
+    )
+
+    eligible = diagnostics[diagnostics["trades_per_year"].fillna(0.0) >= float(min_trades_per_year)].copy()
+    eligible = eligible.sort_values(["selection_score", "walkforward_ann_return"], ascending=False).reset_index(drop=True)
+    default_features = _pick_family_diverse_defaults(eligible, score_col="walkforward_ann_return", top_n=3)
+    return {
+        "eligible": eligible,
+        "default_features": default_features,
+    }
+
+
 def _summarize_submission_model(
     name: str,
     pnl: pd.Series,
@@ -894,7 +982,11 @@ def build_final_submission_payload(
     ridge_alpha: float,
     gb_rounds: int,
     gb_learning_rate: float,
+    selected_features: Tuple[str, ...],
 ) -> Dict[str, object]:
+    pool = build_submission_feature_pool(min_trades_per_year=float(min_trades_per_year))
+    eligible = pool["eligible"].copy()
+    default_features = list(pool["default_features"])
     payload = load_survival_layer(reject_for_missing_logic=False)
     diagnostics = payload["diagnostics"].copy()
     signal_df = payload["signal_df"].copy()
@@ -902,23 +994,25 @@ def build_final_submission_payload(
     tcost = ResearchConfig().tcost
 
     diagnostics["sample_sharpe"] = diagnostics["out_sample_sharpe"].fillna(diagnostics["sharpe"])
-    diagnostics["selection_score"] = (
-        0.50 * _selection_score(diagnostics["sample_sharpe"])
-        + 0.35 * diagnostics["consistency_index"].fillna(0.0)
-        + 0.15 * _selection_score(diagnostics["trades_per_year"].fillna(0.0))
-    )
-    eligible = diagnostics[diagnostics["trades_per_year"].fillna(0.0) >= float(min_trades_per_year)].copy()
-    eligible = eligible.sort_values("selection_score", ascending=False).reset_index(drop=True)
+    diagnostics["walkforward_ann_return"] = diagnostics["out_sample_cagr"].fillna(diagnostics["ann_return"])
+    recommended = eligible.head(int(max(3, top_k))).copy()
 
-    selected = eligible.head(int(max(1, top_k))).copy()
-    selected_features = selected["strategy"].tolist()
-    if not selected_features:
+    eligible_set = set(eligible["strategy"].tolist())
+    selected_features_clean = [s for s in list(selected_features) if s in eligible_set]
+    if not selected_features_clean:
+        selected_features_clean = default_features if default_features else recommended["strategy"].head(3).tolist()
+    if not selected_features_clean:
         return {
             "error": f"No strategies satisfy trades/year >= {min_trades_per_year}. Lower the threshold.",
             "eligible": eligible,
         }
+    selected = eligible[eligible["strategy"].isin(selected_features_clean)].copy()
+    selected["selection_order"] = selected["strategy"].map(
+        {name: i for i, name in enumerate(selected_features_clean, start=1)}
+    )
+    selected = selected.sort_values("selection_order").drop(columns=["selection_order"])
 
-    x = signal_df[selected_features].fillna(0.0).copy()
+    x = signal_df[selected_features_clean].fillna(0.0).copy()
     y = rets.shift(-1).fillna(0.0).reindex(x.index)
     split_idx = int(len(x) * float(split_ratio))
     split_idx = min(max(split_idx, 252), max(len(x) - 5, 1))
@@ -1011,9 +1105,11 @@ def build_final_submission_payload(
 
     variable_glossary = pd.DataFrame(
         [
-            {"variable": "selection_top_k", "value": int(top_k), "description": "Number of features selected (5-10 requested)."},
+            {"variable": "selection_top_k", "value": int(top_k), "description": "Auto-ranked shortlist size shown in the dashboard."},
+            {"variable": "manual_selected_features", "value": int(len(selected_features_clean)), "description": "Count of manually selected features used for model fitting."},
             {"variable": "min_trades_per_year", "value": float(min_trades_per_year), "description": "Minimum trade intensity filter."},
             {"variable": "sample_sharpe", "value": "out_sample_sharpe (fallback sharpe)", "description": "Primary quality metric in ranking."},
+            {"variable": "walkforward_ann_return", "value": "out_sample_cagr (fallback ann_return)", "description": "Walkforward annualized return proxy used for default feature picks."},
             {"variable": "consistency_index", "value": "0/1 from IS/OOS Sharpe sign match", "description": "Stability term in feature ranking."},
             {"variable": "selection_score", "value": "0.50*z(sample_sharpe)+0.35*consistency+0.15*z(trades_per_year)", "description": "Feature ranking formula."},
             {"variable": "split_ratio", "value": float(split_ratio), "description": "Chronological train/test split for model fitting."},
@@ -1030,6 +1126,7 @@ def build_final_submission_payload(
         "strategy",
         "family",
         "sample_sharpe",
+        "walkforward_ann_return",
         "sharpe",
         "consistency_index",
         "trades_per_year",
@@ -1037,12 +1134,15 @@ def build_final_submission_payload(
         "final_robustness_score",
         "OVERFIT_RISK",
     ]
-    selected_view = selected[selected_cols].copy()
+    selected_view = selected[selected_cols].copy().reset_index(drop=True)
+    recommended_view = recommended[selected_cols].copy().reset_index(drop=True)
     eligible_view = eligible[selected_cols].copy()
 
     return {
         "error": "",
-        "selected_features": selected_features,
+        "default_features": default_features,
+        "selected_features": selected_features_clean,
+        "recommended_table": recommended_view,
         "selected_table": selected_view,
         "eligible_table": eligible_view,
         "model_table": model_table,
@@ -1066,11 +1166,11 @@ def render_final_submission_page(show_tutor: bool) -> None:
 
     st.markdown(
         "This page is submission-oriented: it enforces your constraints (sample Sharpe, consistency, trades/year >= 20), "
-        "fits model-based final strategies, and documents every variable used."
+        "fits model-based final strategies, and documents every variable used. Add/remove features and all model outputs update live."
     )
 
     c1, c2, c3, c4 = st.columns(4)
-    top_k = c1.slider("Top features to select", min_value=5, max_value=10, value=7, step=1)
+    top_k = c1.slider("Auto shortlist size", min_value=3, max_value=20, value=10, step=1)
     min_trades = c2.number_input("Minimum trades/year filter", min_value=1.0, max_value=100.0, value=20.0, step=1.0)
     split_ratio = c3.slider("Train ratio", min_value=0.60, max_value=0.85, value=0.70, step=0.05)
     final_model = c4.selectbox(
@@ -1084,6 +1184,38 @@ def render_final_submission_page(show_tutor: bool) -> None:
     gb_rounds = int(m2.slider("Boosting rounds", min_value=20, max_value=200, value=80, step=10))
     gb_lr = st.slider("Boosting learning rate", min_value=0.01, max_value=0.50, value=0.08, step=0.01)
 
+    feature_pool = build_submission_feature_pool(min_trades_per_year=float(min_trades))
+    eligible_pool = feature_pool["eligible"].copy()
+    default_features = list(feature_pool["default_features"])
+    if eligible_pool.empty:
+        st.warning(f"No strategies satisfy trades/year >= {min_trades}. Lower the threshold.")
+        return
+
+    st.markdown("### Feature Basket Control")
+    st.caption(
+        "Default basket = top 3 by walkforward annualized return, each from different families when available."
+    )
+    selection_key = "final_submission_feature_basket"
+    options = eligible_pool["strategy"].tolist()
+    if selection_key not in st.session_state:
+        st.session_state[selection_key] = default_features
+    st.session_state[selection_key] = [s for s in st.session_state[selection_key] if s in options]
+    if not st.session_state[selection_key]:
+        st.session_state[selection_key] = default_features
+
+    if st.button("Reset Basket To Default Top 3"):
+        st.session_state[selection_key] = default_features
+
+    selected_features = st.multiselect(
+        "Add or remove features for the final strategy submission",
+        options=options,
+        key=selection_key,
+        help="Changing this list recalculates coefficients, model metrics, and all charts on this page.",
+    )
+    if not selected_features:
+        st.warning("Select at least one feature to build the final strategy.")
+        return
+
     bundle = build_final_submission_payload(
         top_k=int(top_k),
         min_trades_per_year=float(min_trades),
@@ -1091,6 +1223,7 @@ def render_final_submission_page(show_tutor: bool) -> None:
         ridge_alpha=float(ridge_alpha),
         gb_rounds=int(gb_rounds),
         gb_learning_rate=float(gb_lr),
+        selected_features=tuple(selected_features),
     )
 
     if bundle.get("error"):
@@ -1101,9 +1234,11 @@ def render_final_submission_page(show_tutor: bool) -> None:
 
     st.markdown("### Feature Selection Results")
     st.caption(
-        "Ranking formula: selection_score = 0.50*z(sample_sharpe) + 0.35*consistency_index + 0.15*z(trades_per_year), "
-        "with hard filter trades_per_year >= min threshold."
+        "Ranking formula: selection_score = 0.50*z(sample_sharpe) + 0.35*consistency_index + 0.15*z(trades_per_year). "
+        "Default basket uses highest walkforward annualized return (out_sample_cagr proxy) with family diversification."
     )
+    st.markdown(f"**Default top-3 basket:** `{', '.join(bundle['default_features'])}`")
+    st.dataframe(bundle["recommended_table"].round(4), use_container_width=True, hide_index=True)
     st.markdown(f"**Selected features ({len(bundle['selected_features'])}):** `{', '.join(bundle['selected_features'])}`")
     st.dataframe(bundle["selected_table"].round(4), use_container_width=True, hide_index=True)
 

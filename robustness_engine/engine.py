@@ -457,6 +457,115 @@ def _build_expanded_strategy_family(
         family_map,
     )
 
+    # Time-series adaptive domain (new)
+    for fast in [5, 10, 20]:
+        for slow in [40, 60, 120]:
+            fast_mom = np.sign(close.pct_change(fast))
+            slow_mom = np.sign(close.pct_change(slow))
+            agree = pd.Series(np.where(fast_mom == slow_mom, slow_mom, 0.0), index=idx)
+            _add_strategy(
+                f"time_series_adaptive_dual_mom_{fast}_{slow}",
+                agree,
+                "time_series_adaptive",
+                rets,
+                cfg.tcost,
+                pnl_dict,
+                signal_dict,
+                family_map,
+            )
+
+    for w in [10, 20, 40, 60]:
+        ewm_mean = rets.ewm(span=w, adjust=False).mean()
+        ewm_vol = rets.ewm(span=w, adjust=False).std()
+        edge = (ewm_mean / (ewm_vol + EPS)).clip(-1.75, 1.75)
+        _add_strategy(
+            f"time_series_adaptive_ewm_edge_{w}",
+            edge,
+            "time_series_adaptive",
+            rets,
+            cfg.tcost,
+            pnl_dict,
+            signal_dict,
+            family_map,
+        )
+
+    # Event-flow domain (new)
+    quarter_start = pd.Series(idx.is_quarter_start.astype(float), index=idx)
+    quarter_end = pd.Series(idx.is_quarter_end.astype(float), index=idx)
+    quarter_turn = quarter_start - quarter_end
+    _add_strategy(
+        "event_flow_quarter_turn",
+        quarter_turn,
+        "event_flow",
+        rets,
+        cfg.tcost,
+        pnl_dict,
+        signal_dict,
+        family_map,
+    )
+    _add_strategy(
+        "event_flow_quarter_turn_reversion",
+        -quarter_turn,
+        "event_flow",
+        rets,
+        cfg.tcost,
+        pnl_dict,
+        signal_dict,
+        family_map,
+    )
+
+    turn_window = features["turn_of_month"].fillna(0.0)
+    _add_strategy(
+        "event_flow_turn_of_month_trend",
+        pd.Series(np.where(turn_window > 0, np.sign(close.pct_change(10)), 0.0), index=idx),
+        "event_flow",
+        rets,
+        cfg.tcost,
+        pnl_dict,
+        signal_dict,
+        family_map,
+    )
+    _add_strategy(
+        "event_flow_turn_of_month_revert",
+        pd.Series(np.where(turn_window > 0, -np.sign(close.pct_change(5)), 0.0), index=idx),
+        "event_flow",
+        rets,
+        cfg.tcost,
+        pnl_dict,
+        signal_dict,
+        family_map,
+    )
+
+    # Risk overlay domain (new)
+    for w in [20, 60, 120]:
+        base_trend = np.sign(close.pct_change(w))
+        vol = rets.rolling(w).std()
+        target = 0.12
+        risk_budget = (target / (vol * np.sqrt(252) + EPS)).clip(0.0, 1.75)
+        _add_strategy(
+            f"risk_overlay_vol_budget_{w}",
+            pd.Series(base_trend, index=idx) * risk_budget,
+            "risk_overlay",
+            rets,
+            cfg.tcost,
+            pnl_dict,
+            signal_dict,
+            family_map,
+        )
+
+    dd120 = close / close.rolling(120).max() - 1.0
+    dd_cut = pd.Series(np.where(dd120 < -0.12, 0.4, 1.0), index=idx)
+    _add_strategy(
+        "risk_overlay_drawdown_cutback",
+        pd.Series(np.sign(close.pct_change(60)), index=idx) * dd_cut,
+        "risk_overlay",
+        rets,
+        cfg.tcost,
+        pnl_dict,
+        signal_dict,
+        family_map,
+    )
+
     pnl_df = pd.DataFrame(pnl_dict).replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="all")
     signal_df = pd.DataFrame(signal_dict).reindex(columns=pnl_df.columns).fillna(0.0)
     return pnl_df, signal_df, family_map

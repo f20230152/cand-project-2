@@ -641,6 +641,204 @@ def build_strategy_library(
                 family_map,
             )
 
+    # Time-series domain (additive expansion)
+    for fast in [5, 10, 20]:
+        for slow in [40, 60, 120, 180]:
+            fast_mom = np.sign(close.pct_change(fast))
+            slow_mom = np.sign(close.pct_change(slow))
+            agree = pd.Series(np.where(fast_mom == slow_mom, slow_mom, 0.0), index=idx)
+            add_strategy(
+                f"ts_dual_mom_{fast}_{slow}",
+                agree,
+                rets,
+                cfg.tcost,
+                "time_series",
+                pnl_dict,
+                signal_dict,
+                family_map,
+            )
+
+    for w in [10, 20, 40, 60]:
+        ewm_mean = rets.ewm(span=w, adjust=False).mean()
+        ewm_vol = rets.ewm(span=w, adjust=False).std()
+        edge = (ewm_mean / (ewm_vol + EPS)).clip(-2.0, 2.0)
+        add_strategy(
+            f"ts_ewm_edge_{w}",
+            edge,
+            rets,
+            cfg.tcost,
+            "time_series",
+            pnl_dict,
+            signal_dict,
+            family_map,
+        )
+
+    for w in [20, 40, 60, 120]:
+        strength = close.pct_change(w) / (rets.rolling(w).std() * np.sqrt(w) + EPS)
+        for thr in [0.25, 0.5, 0.75]:
+            raw = pd.Series(np.where(strength > thr, 1.0, np.where(strength < -thr, -1.0, 0.0)), index=idx)
+            add_strategy(
+                f"ts_strength_{w}_{thr:.2f}",
+                raw,
+                rets,
+                cfg.tcost,
+                "time_series",
+                pnl_dict,
+                signal_dict,
+                family_map,
+            )
+
+    for w in [20, 60, 120]:
+        drawdown_gate = pd.Series(np.where(features[f"drawdown_{w}"] < -0.12, 0.0, 1.0), index=idx)
+        vol_gate = pd.Series(np.where(features[f"vol_pct_{w}"] < 0.80, 1.0, 0.0), index=idx)
+        gated_trend = np.sign(close.pct_change(w)) * drawdown_gate * vol_gate
+        add_strategy(
+            f"ts_drawdown_vol_gate_{w}",
+            gated_trend,
+            rets,
+            cfg.tcost,
+            "time_series",
+            pnl_dict,
+            signal_dict,
+            family_map,
+        )
+
+    # Event-flow domain (new)
+    quarter_start = pd.Series(idx.is_quarter_start.astype(float), index=idx)
+    quarter_end = pd.Series(idx.is_quarter_end.astype(float), index=idx)
+    for side in [-1.0, 1.0]:
+        quarter_turn = side * quarter_start - side * quarter_end
+        add_strategy(
+            f"event_quarter_turn_{int(side)}",
+            quarter_turn,
+            rets,
+            cfg.tcost,
+            "event_flow",
+            pnl_dict,
+            signal_dict,
+            family_map,
+        )
+
+    event_month = features["pre_opec_season_proxy"].fillna(0.0)
+    event_trend = np.sign(close.pct_change(15))
+    add_strategy(
+        "event_opec_proxy_trend",
+        pd.Series(np.where(event_month > 0, event_trend, 0.0), index=idx),
+        rets,
+        cfg.tcost,
+        "event_flow",
+        pnl_dict,
+        signal_dict,
+        family_map,
+    )
+    add_strategy(
+        "event_opec_proxy_reversion",
+        pd.Series(np.where(event_month > 0, -event_trend, 0.0), index=idx),
+        rets,
+        cfg.tcost,
+        "event_flow",
+        pnl_dict,
+        signal_dict,
+        family_map,
+    )
+
+    turn_window = features["turn_of_month"].fillna(0.0)
+    add_strategy(
+        "event_turn_month_trend",
+        pd.Series(np.where(turn_window > 0, np.sign(close.pct_change(10)), 0.0), index=idx),
+        rets,
+        cfg.tcost,
+        "event_flow",
+        pnl_dict,
+        signal_dict,
+        family_map,
+    )
+    add_strategy(
+        "event_turn_month_reversion",
+        pd.Series(np.where(turn_window > 0, -np.sign(close.pct_change(5)), 0.0), index=idx),
+        rets,
+        cfg.tcost,
+        "event_flow",
+        pnl_dict,
+        signal_dict,
+        family_map,
+    )
+
+    for d in range(5):
+        weekday_trend = pd.Series(np.where(idx.dayofweek == d, np.sign(close.pct_change(20)), 0.0), index=idx)
+        weekday_revert = pd.Series(np.where(idx.dayofweek == d, -np.sign(close.pct_change(3)), 0.0), index=idx)
+        add_strategy(
+            f"event_weekday_trend_{d}",
+            weekday_trend,
+            rets,
+            cfg.tcost,
+            "event_flow",
+            pnl_dict,
+            signal_dict,
+            family_map,
+        )
+        add_strategy(
+            f"event_weekday_revert_{d}",
+            weekday_revert,
+            rets,
+            cfg.tcost,
+            "event_flow",
+            pnl_dict,
+            signal_dict,
+            family_map,
+        )
+
+    # Microstructure proxy domain (new)
+    for lag in [1, 2, 3, 5]:
+        lag_ret = rets.shift(lag)
+        lag_sum = rets.rolling(lag).sum()
+        add_strategy(
+            f"micro_lag_revert_{lag}",
+            -np.sign(lag_ret),
+            rets,
+            cfg.tcost,
+            "microstructure_proxy",
+            pnl_dict,
+            signal_dict,
+            family_map,
+        )
+        add_strategy(
+            f"micro_lag_momentum_{lag}",
+            np.sign(lag_sum),
+            rets,
+            cfg.tcost,
+            "microstructure_proxy",
+            pnl_dict,
+            signal_dict,
+            family_map,
+        )
+
+    shock_cut = rets.abs().rolling(126).quantile(0.90)
+    post_shock = (rets.abs().shift(1) > shock_cut.shift(1)).fillna(False)
+    add_strategy(
+        "micro_post_shock_reversal",
+        pd.Series(np.where(post_shock, -np.sign(rets.shift(1)), 0.0), index=idx),
+        rets,
+        cfg.tcost,
+        "microstructure_proxy",
+        pnl_dict,
+        signal_dict,
+        family_map,
+    )
+
+    calm = (features["rv_20"] < features["rv_20"].rolling(252).median()).fillna(False)
+    bounce = pd.Series(np.where(calm, -np.sign(rets.shift(1)), np.sign(close.pct_change(20))), index=idx)
+    add_strategy(
+        "micro_calm_bounce_vs_trend",
+        bounce,
+        rets,
+        cfg.tcost,
+        "microstructure_proxy",
+        pnl_dict,
+        signal_dict,
+        family_map,
+    )
+
     pnl_df = pd.DataFrame(pnl_dict).replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="all")
     signal_df = pd.DataFrame(signal_dict).reindex(columns=pnl_df.columns)
     return pnl_df, signal_df, family_map

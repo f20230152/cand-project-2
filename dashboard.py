@@ -1610,8 +1610,31 @@ def render_final_submission_page(show_tutor: bool) -> None:
 
     show_fixed_key = "final_submission_show_fixed_best5"
     forced_model_key = "final_submission_forced_model"
+    pending_apply_key = "final_submission_pending_apply"
+    selection_key = "final_submission_feature_basket"
+
     if show_fixed_key not in st.session_state:
         st.session_state[show_fixed_key] = False
+
+    pending_apply = st.session_state.pop(pending_apply_key, None)
+    if isinstance(pending_apply, dict):
+        if "selected_features" in pending_apply and isinstance(pending_apply["selected_features"], list):
+            st.session_state[selection_key] = [str(x) for x in pending_apply["selected_features"]]
+        if "top_k" in pending_apply:
+            st.session_state["final_submission_top_k"] = int(pending_apply["top_k"])
+        if "min_trades_per_year" in pending_apply:
+            st.session_state["final_submission_min_trades"] = float(pending_apply["min_trades_per_year"])
+        if "split_ratio" in pending_apply:
+            st.session_state["final_submission_split_ratio"] = float(pending_apply["split_ratio"])
+        if "ridge_alpha" in pending_apply:
+            st.session_state["final_submission_ridge_alpha"] = float(pending_apply["ridge_alpha"])
+        if "gb_rounds" in pending_apply:
+            st.session_state["final_submission_gb_rounds"] = int(pending_apply["gb_rounds"])
+        if "gb_learning_rate" in pending_apply:
+            st.session_state["final_submission_gb_lr"] = float(pending_apply["gb_learning_rate"])
+        if "final_model" in pending_apply:
+            st.session_state[forced_model_key] = str(pending_apply["final_model"])
+        st.session_state[show_fixed_key] = True
 
     if st.button("Show Best 5 Proposed Strategies", key="final_submission_show_best5_button"):
         st.session_state[show_fixed_key] = True
@@ -1675,7 +1698,6 @@ def render_final_submission_page(show_tutor: bool) -> None:
     st.caption(
         "Default basket = top 3 by walkforward annualized return, each from different families when available."
     )
-    selection_key = "final_submission_feature_basket"
     proposal_choice_key = "final_submission_fixed_proposal_choice"
     proposal_applied_key = "final_submission_fixed_proposal_applied"
     options = eligible_pool["strategy"].tolist()
@@ -1687,16 +1709,16 @@ def render_final_submission_page(show_tutor: bool) -> None:
 
     def _apply_proposal_row(row: pd.Series) -> None:
         chosen_features = [s for s in str(row["features_csv"]).split("|") if s in options]
-        if chosen_features:
-            st.session_state[selection_key] = chosen_features
-        st.session_state["final_submission_top_k"] = int(row["top_k"])
-        st.session_state["final_submission_min_trades"] = float(row["min_trades_per_year"])
-        st.session_state["final_submission_split_ratio"] = float(row["split_ratio"])
-        st.session_state["final_submission_ridge_alpha"] = float(row["ridge_alpha"])
-        st.session_state["final_submission_gb_rounds"] = int(row["gb_rounds"])
-        st.session_state["final_submission_gb_lr"] = float(row["gb_learning_rate"])
-        st.session_state[forced_model_key] = str(row["final_model"])
-        st.session_state[show_fixed_key] = True
+        st.session_state[pending_apply_key] = {
+            "selected_features": chosen_features,
+            "top_k": int(row["top_k"]),
+            "min_trades_per_year": float(row["min_trades_per_year"]),
+            "split_ratio": float(row["split_ratio"]),
+            "ridge_alpha": float(row["ridge_alpha"]),
+            "gb_rounds": int(row["gb_rounds"]),
+            "gb_learning_rate": float(row["gb_learning_rate"]),
+            "final_model": str(row["final_model"]),
+        }
 
     with st.sidebar:
         st.markdown("---")

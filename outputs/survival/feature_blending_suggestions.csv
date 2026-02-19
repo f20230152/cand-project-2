@@ -1,0 +1,6 @@
+pair,correlation,recommendation
+ml_light_random_forest_vote vs stat_hurst_120,-0.18099418127714578,"Negative correlation detected, good blending candidate."
+ml_light_random_forest_vote vs ml_linear_thr_40_0.00,-0.18586511554654603,"Negative correlation detected, good blending candidate."
+ml_light_random_forest_vote vs ml_linear_score_40,-0.18586511554654603,"Negative correlation detected, good blending candidate."
+stat_hurst_120 vs regime_markov_switch_proxy,-0.18793863356174803,"Negative correlation detected, good blending candidate."
+ml_linear_thr_40_0.00 vs ml_linear_score_40,1.0,"Correlation > 0.95, remove one of ml_linear_thr_40_0.00 or ml_linear_score_40."

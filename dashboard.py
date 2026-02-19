@@ -901,6 +901,100 @@ def _selection_score(series: pd.Series) -> pd.Series:
     return (s - s.mean()) / (s.std() + 1e-12)
 
 
+def _fit_model_signals_on_slice(
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    x_pred: pd.DataFrame,
+    ridge_alpha: float,
+    gb_rounds: int,
+    gb_learning_rate: float,
+) -> Tuple[pd.Series, pd.Series]:
+    if x_pred.empty:
+        empty = pd.Series(dtype=float, index=x_pred.index)
+        return empty, empty
+
+    x_train = x_train.fillna(0.0)
+    x_pred = x_pred.fillna(0.0)
+    y_train = y_train.reindex(x_train.index).fillna(0.0)
+    if x_train.empty:
+        zeros = pd.Series(0.0, index=x_pred.index)
+        return zeros.copy(), zeros.copy()
+
+    mu = x_train.mean()
+    sd = x_train.std().replace(0.0, 1.0)
+    x_train_std = ((x_train - mu) / sd).fillna(0.0)
+    x_pred_std = ((x_pred - mu) / sd).fillna(0.0)
+
+    x_train_np = x_train_std.to_numpy()
+    y_train_np = y_train.to_numpy()
+    x_pred_np = x_pred_std.to_numpy()
+
+    beta = _fit_ridge_beta(x_train_np, y_train_np, alpha=float(ridge_alpha))
+    ridge_train_score = pd.Series(x_train_np @ beta, index=x_train.index)
+    ridge_pred_score = pd.Series(x_pred_np @ beta, index=x_pred.index)
+
+    gb_base, gb_components = _fit_gradient_boosting_proxy(
+        x_train_np,
+        y_train_np,
+        n_rounds=int(gb_rounds),
+        learning_rate=float(gb_learning_rate),
+    )
+    gb_train_score = pd.Series(_predict_gradient_boosting_proxy(x_train_np, gb_base, gb_components), index=x_train.index)
+    gb_pred_score = pd.Series(_predict_gradient_boosting_proxy(x_pred_np, gb_base, gb_components), index=x_pred.index)
+
+    ridge_scale = max(float(ridge_train_score.std()), 1e-6)
+    gb_scale = max(float(gb_train_score.std()), 1e-6)
+    ridge_signal = pd.Series(np.tanh(ridge_pred_score / ridge_scale), index=x_pred.index)
+    gb_signal = pd.Series(np.tanh(gb_pred_score / gb_scale), index=x_pred.index)
+    return ridge_signal, gb_signal
+
+
+def _apply_quarterly_oos_rebalance(
+    x: pd.DataFrame,
+    y: pd.Series,
+    split_idx: int,
+    base_ridge_signal: pd.Series,
+    base_gb_signal: pd.Series,
+    ridge_alpha: float,
+    gb_rounds: int,
+    gb_learning_rate: float,
+) -> Tuple[pd.Series, pd.Series]:
+    ridge_q = base_ridge_signal.copy()
+    gb_q = base_gb_signal.copy()
+    if split_idx >= len(x):
+        return ridge_q, gb_q
+
+    oos_index = x.index[split_idx:]
+    oos_groups = pd.Series(oos_index, index=oos_index).groupby(oos_index.to_period("Q"))
+    for _, segment in oos_groups:
+        seg_idx = segment.index
+        if len(seg_idx) == 0:
+            continue
+        start_dt = seg_idx.min()
+        start_loc = x.index.get_loc(start_dt)
+        if isinstance(start_loc, slice):
+            start_loc = start_loc.start
+        start_loc = int(start_loc)
+        if start_loc <= 0:
+            continue
+
+        x_train = x.iloc[:start_loc]
+        y_train = y.iloc[:start_loc]
+        x_pred = x.loc[seg_idx]
+        ridge_seg, gb_seg = _fit_model_signals_on_slice(
+            x_train=x_train,
+            y_train=y_train,
+            x_pred=x_pred,
+            ridge_alpha=float(ridge_alpha),
+            gb_rounds=int(gb_rounds),
+            gb_learning_rate=float(gb_learning_rate),
+        )
+        ridge_q.loc[seg_idx] = ridge_seg
+        gb_q.loc[seg_idx] = gb_seg
+
+    return ridge_q.fillna(0.0), gb_q.fillna(0.0)
+
+
 def _pick_family_diverse_defaults(
     eligible: pd.DataFrame,
     score_col: str,
@@ -989,12 +1083,37 @@ def build_final_submission_payload(
     default_features = list(pool["default_features"])
     payload = load_survival_layer(reject_for_missing_logic=False)
     diagnostics = payload["diagnostics"].copy()
+    pnl_df = payload["pnl_df"].copy()
     signal_df = payload["signal_df"].copy()
     rets = payload["returns"].copy()
     tcost = ResearchConfig().tcost
 
     diagnostics["sample_sharpe"] = diagnostics["out_sample_sharpe"].fillna(diagnostics["sharpe"])
     diagnostics["walkforward_ann_return"] = diagnostics["out_sample_cagr"].fillna(diagnostics["ann_return"])
+
+    if eligible.empty:
+        return {
+            "error": f"No strategies satisfy trades/year >= {min_trades_per_year}. Lower the threshold.",
+            "eligible": eligible,
+        }
+
+    x_universe = signal_df[eligible["strategy"].tolist()].fillna(0.0).copy()
+    y = rets.shift(-1).fillna(0.0).reindex(x_universe.index)
+    split_idx = int(len(x_universe) * float(split_ratio))
+    split_idx = min(max(split_idx, 252), max(len(x_universe) - 5, 1))
+
+    benchmark_full = compute_metrics(y)
+    benchmark_is = compute_metrics(y.iloc[:split_idx])
+    benchmark_oos = compute_metrics(y.iloc[split_idx:])
+
+    eligible["oos_ann_return"] = eligible["out_sample_cagr"].fillna(eligible["ann_return"])
+    eligible["oos_sharpe"] = eligible["out_sample_sharpe"].fillna(eligible["sharpe"])
+    eligible["oos_excess_ann_return_vs_brent"] = eligible["oos_ann_return"] - float(benchmark_oos["ann_return"])
+    eligible["oos_excess_sharpe_vs_brent"] = eligible["oos_sharpe"] - float(benchmark_oos["sharpe"])
+    eligible["beats_brent_oos_ann_return"] = eligible["oos_ann_return"] > float(benchmark_oos["ann_return"])
+    eligible["beats_brent_oos_sharpe"] = eligible["oos_sharpe"] > float(benchmark_oos["sharpe"])
+    eligible["beats_brent_oos"] = eligible["beats_brent_oos_ann_return"] & eligible["beats_brent_oos_sharpe"]
+    eligible = eligible.sort_values(["selection_score", "walkforward_ann_return"], ascending=False).reset_index(drop=True)
     recommended = eligible.head(int(max(3, top_k))).copy()
 
     eligible_set = set(eligible["strategy"].tolist())
@@ -1006,6 +1125,7 @@ def build_final_submission_payload(
             "error": f"No strategies satisfy trades/year >= {min_trades_per_year}. Lower the threshold.",
             "eligible": eligible,
         }
+
     selected = eligible[eligible["strategy"].isin(selected_features_clean)].copy()
     selected["selection_order"] = selected["strategy"].map(
         {name: i for i, name in enumerate(selected_features_clean, start=1)}
@@ -1014,8 +1134,6 @@ def build_final_submission_payload(
 
     x = signal_df[selected_features_clean].fillna(0.0).copy()
     y = rets.shift(-1).fillna(0.0).reindex(x.index)
-    split_idx = int(len(x) * float(split_ratio))
-    split_idx = min(max(split_idx, 252), max(len(x) - 5, 1))
 
     x_train = x.iloc[:split_idx]
     mu = x_train.mean()
@@ -1047,28 +1165,57 @@ def build_final_submission_payload(
     ridge_signal = score_to_signal(ridge_score)
     gb_signal = score_to_signal(gb_score)
     ensemble_signal = 0.5 * ridge_signal + 0.5 * gb_signal
+    ridge_q_signal, gb_q_signal = _apply_quarterly_oos_rebalance(
+        x=x,
+        y=y,
+        split_idx=split_idx,
+        base_ridge_signal=ridge_signal,
+        base_gb_signal=gb_signal,
+        ridge_alpha=float(ridge_alpha),
+        gb_rounds=int(gb_rounds),
+        gb_learning_rate=float(gb_learning_rate),
+    )
+    ensemble_q_signal = 0.5 * ridge_q_signal + 0.5 * gb_q_signal
     eq_signal = x.mean(axis=1).clip(-1.0, 1.0)
 
     def signal_to_pnl(signal: pd.Series) -> pd.Series:
         turnover = signal.diff().abs().fillna(0.0)
         return signal * y - float(tcost) * turnover
 
+    best_pool_candidates = eligible.sort_values(
+        ["beats_brent_oos", "oos_excess_ann_return_vs_brent", "oos_excess_sharpe_vs_brent", "selection_score"],
+        ascending=False,
+    )
+    best_pool_strategy = str(best_pool_candidates.iloc[0]["strategy"])
+    best_pool_model_label = f"Best Pool Strategy ({best_pool_strategy})"
+    best_pool_signal = signal_df[best_pool_strategy].reindex(x.index).fillna(0.0).rename("best_pool_strategy_signal")
+    best_pool_pnl = pnl_df[best_pool_strategy].reindex(x.index).fillna(0.0).rename("best_pool_strategy")
+
     pnl_map = {
         "Linear Regression": signal_to_pnl(ridge_signal).rename("linear_regression"),
+        "Linear Regression (Quarterly Rebalanced OOS)": signal_to_pnl(ridge_q_signal).rename("linear_regression_quarterly_oos"),
         "Gradient Boosting Proxy": signal_to_pnl(gb_signal).rename("gradient_boosting_proxy"),
+        "Gradient Boosting Proxy (Quarterly Rebalanced OOS)": signal_to_pnl(gb_q_signal).rename("gradient_boosting_proxy_quarterly_oos"),
         "Ensemble (50/50)": signal_to_pnl(ensemble_signal).rename("ensemble_50_50"),
+        "Ensemble (Quarterly Rebalanced OOS)": signal_to_pnl(ensemble_q_signal).rename("ensemble_quarterly_oos"),
         "Equal-Weight Feature Blend": signal_to_pnl(eq_signal).rename("equal_weight_features"),
+        best_pool_model_label: best_pool_pnl,
         "Buy & Hold Brent": y.rename("buy_hold_brent"),
     }
     signal_map = {
         "Linear Regression": ridge_signal.rename("linear_regression_signal"),
+        "Linear Regression (Quarterly Rebalanced OOS)": ridge_q_signal.rename("linear_regression_quarterly_oos_signal"),
         "Gradient Boosting Proxy": gb_signal.rename("gradient_boosting_proxy_signal"),
+        "Gradient Boosting Proxy (Quarterly Rebalanced OOS)": gb_q_signal.rename("gradient_boosting_proxy_quarterly_oos_signal"),
         "Ensemble (50/50)": ensemble_signal.rename("ensemble_signal"),
+        "Ensemble (Quarterly Rebalanced OOS)": ensemble_q_signal.rename("ensemble_quarterly_oos_signal"),
         "Equal-Weight Feature Blend": eq_signal.rename("equal_weight_feature_signal"),
+        best_pool_model_label: best_pool_signal,
     }
 
     model_rows = []
-    for model_name in ["Linear Regression", "Gradient Boosting Proxy", "Ensemble (50/50)", "Equal-Weight Feature Blend"]:
+    model_names = list(signal_map.keys())
+    for model_name in model_names:
         model_rows.append(
             _summarize_submission_model(
                 model_name,
@@ -1077,7 +1224,20 @@ def build_final_submission_payload(
                 split_idx=split_idx,
             )
         )
-    model_table = pd.DataFrame(model_rows).sort_values("out_sample_sharpe", ascending=False).reset_index(drop=True)
+    model_table = pd.DataFrame(model_rows)
+    model_table["oos_excess_ann_return_vs_brent"] = model_table["out_sample_ann_return"] - float(benchmark_oos["ann_return"])
+    model_table["oos_excess_sharpe_vs_brent"] = model_table["out_sample_sharpe"] - float(benchmark_oos["sharpe"])
+    model_table["full_excess_ann_return_vs_brent"] = model_table["full_sample_ann_return"] - float(benchmark_full["ann_return"])
+    model_table["full_excess_sharpe_vs_brent"] = model_table["full_sample_sharpe"] - float(benchmark_full["sharpe"])
+    model_table["beats_brent_oos_ann_return"] = model_table["out_sample_ann_return"] > float(benchmark_oos["ann_return"])
+    model_table["beats_brent_oos_sharpe"] = model_table["out_sample_sharpe"] > float(benchmark_oos["sharpe"])
+    model_table["beats_brent_full_ann_return"] = model_table["full_sample_ann_return"] > float(benchmark_full["ann_return"])
+    model_table["beats_brent_full_sharpe"] = model_table["full_sample_sharpe"] > float(benchmark_full["sharpe"])
+    model_table["beats_brent_oos"] = model_table["beats_brent_oos_ann_return"] & model_table["beats_brent_oos_sharpe"]
+    model_table = model_table.sort_values(
+        ["beats_brent_oos", "oos_excess_ann_return_vs_brent", "oos_excess_sharpe_vs_brent", "out_sample_sharpe"],
+        ascending=False,
+    ).reset_index(drop=True)
 
     linear_coef = (
         pd.DataFrame({"feature": x.columns, "coefficient": beta})
@@ -1107,6 +1267,7 @@ def build_final_submission_payload(
         [
             {"variable": "selection_top_k", "value": int(top_k), "description": "Auto-ranked shortlist size shown in the dashboard."},
             {"variable": "manual_selected_features", "value": int(len(selected_features_clean)), "description": "Count of manually selected features used for model fitting."},
+            {"variable": "test_period_rebalance", "value": "Quarterly", "description": "Linear/GB/Ensemble are re-fitted each calendar quarter in the OOS segment."},
             {"variable": "min_trades_per_year", "value": float(min_trades_per_year), "description": "Minimum trade intensity filter."},
             {"variable": "sample_sharpe", "value": "out_sample_sharpe (fallback sharpe)", "description": "Primary quality metric in ranking."},
             {"variable": "walkforward_ann_return", "value": "out_sample_cagr (fallback ann_return)", "description": "Walkforward annualized return proxy used for default feature picks."},
@@ -1127,6 +1288,11 @@ def build_final_submission_payload(
         "family",
         "sample_sharpe",
         "walkforward_ann_return",
+        "oos_ann_return",
+        "oos_sharpe",
+        "oos_excess_ann_return_vs_brent",
+        "oos_excess_sharpe_vs_brent",
+        "beats_brent_oos",
         "sharpe",
         "consistency_index",
         "trades_per_year",
@@ -1136,15 +1302,26 @@ def build_final_submission_payload(
     ]
     selected_view = selected[selected_cols].copy().reset_index(drop=True)
     recommended_view = recommended[selected_cols].copy().reset_index(drop=True)
-    eligible_view = eligible[selected_cols].copy()
+    eligible_view = eligible[selected_cols].copy().reset_index(drop=True)
+
+    beaters = eligible[eligible["beats_brent_oos"]].copy()
+    if beaters.empty:
+        beaters = eligible.copy()
+    index_beaters_view = beaters.sort_values(
+        ["oos_excess_ann_return_vs_brent", "oos_excess_sharpe_vs_brent", "selection_score"],
+        ascending=False,
+    ).head(15)[selected_cols].reset_index(drop=True)
 
     return {
         "error": "",
         "default_features": default_features,
         "selected_features": selected_features_clean,
+        "best_pool_strategy": best_pool_strategy,
+        "best_pool_model_label": best_pool_model_label,
         "recommended_table": recommended_view,
         "selected_table": selected_view,
         "eligible_table": eligible_view,
+        "index_beaters_table": index_beaters_view,
         "model_table": model_table,
         "linear_coefficients": linear_coef,
         "boosting_summary": boost_summary,
@@ -1153,6 +1330,14 @@ def build_final_submission_payload(
         "signal_map": signal_map,
         "split_idx": int(split_idx),
         "returns_target": y,
+        "benchmark_metrics": {
+            "full_ann_return": float(benchmark_full["ann_return"]),
+            "full_sharpe": float(benchmark_full["sharpe"]),
+            "is_ann_return": float(benchmark_is["ann_return"]),
+            "is_sharpe": float(benchmark_is["sharpe"]),
+            "oos_ann_return": float(benchmark_oos["ann_return"]),
+            "oos_sharpe": float(benchmark_oos["sharpe"]),
+        },
     }
 
 
@@ -1166,18 +1351,15 @@ def render_final_submission_page(show_tutor: bool) -> None:
 
     st.markdown(
         "This page is submission-oriented: it enforces your constraints (sample Sharpe, consistency, trades/year >= 20), "
-        "fits model-based final strategies, and documents every variable used. Add/remove features and all model outputs update live."
+        "fits model-based final strategies, and documents every variable used. Add/remove features and all model outputs update live. "
+        "Model-based strategies are quarterly rebalanced in the test period."
     )
 
     c1, c2, c3, c4 = st.columns(4)
     top_k = c1.slider("Auto shortlist size", min_value=3, max_value=20, value=10, step=1)
     min_trades = c2.number_input("Minimum trades/year filter", min_value=1.0, max_value=100.0, value=20.0, step=1.0)
     split_ratio = c3.slider("Train ratio", min_value=0.60, max_value=0.85, value=0.70, step=0.05)
-    final_model = c4.selectbox(
-        "Final strategy model",
-        options=["Ensemble (50/50)", "Linear Regression", "Gradient Boosting Proxy", "Equal-Weight Feature Blend"],
-        index=0,
-    )
+    c4.metric("Test Rebalance", "Quarterly")
 
     m1, m2 = st.columns(2)
     ridge_alpha = m1.number_input("Ridge alpha", min_value=0.1, max_value=20.0, value=4.0, step=0.1)
@@ -1241,6 +1423,10 @@ def render_final_submission_page(show_tutor: bool) -> None:
     st.dataframe(bundle["recommended_table"].round(4), use_container_width=True, hide_index=True)
     st.markdown(f"**Selected features ({len(bundle['selected_features'])}):** `{', '.join(bundle['selected_features'])}`")
     st.dataframe(bundle["selected_table"].round(4), use_container_width=True, hide_index=True)
+    st.markdown(f"**Best pool strategy vs Brent (auto-picked):** `{bundle['best_pool_strategy']}`")
+
+    st.markdown("### Top Strategies That Beat Brent (From Eligible Pool)")
+    st.dataframe(bundle["index_beaters_table"].round(4), use_container_width=True, hide_index=True)
 
     with st.expander("See full eligible feature pool", expanded=False):
         st.dataframe(bundle["eligible_table"].round(4), use_container_width=True, hide_index=True)
@@ -1259,6 +1445,17 @@ def render_final_submission_page(show_tutor: bool) -> None:
     st.markdown("### Model Performance (Full Sample + IS/OOS)")
     st.dataframe(bundle["model_table"].round(4), use_container_width=True, hide_index=True)
 
+    model_options = [m for m in bundle["model_table"]["model"].tolist() if m in bundle["signal_map"]]
+    if not model_options:
+        st.warning("No model outputs available for final strategy selection.")
+        return
+    default_model = "Ensemble (Quarterly Rebalanced OOS)" if "Ensemble (Quarterly Rebalanced OOS)" in model_options else model_options[0]
+    final_model = st.selectbox(
+        "Final strategy model",
+        options=model_options,
+        index=max(model_options.index(default_model), 0),
+    )
+
     final_pnl = bundle["pnl_map"][final_model]
     final_signal = bundle["signal_map"][final_model]
     target_rets = bundle["returns_target"]
@@ -1268,15 +1465,26 @@ def render_final_submission_page(show_tutor: bool) -> None:
     st.markdown(f"### Final Strategy KPI Scorecard: `{final_model}`")
     show_kpi_tiles(kpis, show_tutor=show_tutor)
 
-    compare = pd.DataFrame(
-        {
-            "Final Strategy": (1.0 + final_pnl.fillna(0.0)).cumprod(),
-            "Buy & Hold Brent": (1.0 + target_rets.fillna(0.0)).cumprod(),
-            "Linear Regression": (1.0 + bundle["pnl_map"]["Linear Regression"].fillna(0.0)).cumprod(),
-            "Gradient Boosting Proxy": (1.0 + bundle["pnl_map"]["Gradient Boosting Proxy"].fillna(0.0)).cumprod(),
-        },
-        index=final_pnl.index,
-    )
+    bench = bundle["benchmark_metrics"]
+    final_oos = compute_metrics(final_pnl.iloc[split_idx:], final_signal.iloc[split_idx:])
+    final_full = compute_metrics(final_pnl, final_signal)
+    beats_oos = (final_oos["ann_return"] > bench["oos_ann_return"]) and (final_oos["sharpe"] > bench["oos_sharpe"])
+    bx1, bx2, bx3, bx4 = st.columns(4)
+    bx1.metric("OOS Excess Ann Return vs Brent", pct(final_oos["ann_return"] - bench["oos_ann_return"]))
+    bx2.metric("OOS Excess Sharpe vs Brent", fmt(final_oos["sharpe"] - bench["oos_sharpe"], 3))
+    bx3.metric("Full Excess Ann Return vs Brent", pct(final_full["ann_return"] - bench["full_ann_return"]))
+    bx4.metric("Beats Brent OOS?", "Yes" if beats_oos else "No")
+
+    compare_curves = {
+        "Final Strategy": (1.0 + final_pnl.fillna(0.0)).cumprod(),
+        "Buy & Hold Brent": (1.0 + target_rets.fillna(0.0)).cumprod(),
+    }
+    best_pool_label = str(bundle["best_pool_model_label"])
+    if best_pool_label in bundle["pnl_map"] and best_pool_label != final_model:
+        compare_curves["Best Pool Strategy"] = (1.0 + bundle["pnl_map"][best_pool_label].fillna(0.0)).cumprod()
+    if "Ensemble (Quarterly Rebalanced OOS)" in bundle["pnl_map"] and final_model != "Ensemble (Quarterly Rebalanced OOS)":
+        compare_curves["Quarterly Ensemble"] = (1.0 + bundle["pnl_map"]["Ensemble (Quarterly Rebalanced OOS)"].fillna(0.0)).cumprod()
+    compare = pd.DataFrame(compare_curves, index=final_pnl.index)
     fig = px.line(compare.reset_index(), x="date", y=compare.columns.tolist(), title="Final Strategy vs Benchmarks")
     if not compare.empty:
         split_loc = min(max(split_idx, 0), len(compare.index) - 1)

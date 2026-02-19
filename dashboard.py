@@ -1610,31 +1610,10 @@ def render_final_submission_page(show_tutor: bool) -> None:
 
     show_fixed_key = "final_submission_show_fixed_best5"
     forced_model_key = "final_submission_forced_model"
-    pending_apply_key = "final_submission_pending_apply"
     selection_key = "final_submission_feature_basket"
 
     if show_fixed_key not in st.session_state:
         st.session_state[show_fixed_key] = False
-
-    pending_apply = st.session_state.pop(pending_apply_key, None)
-    if isinstance(pending_apply, dict):
-        if "selected_features" in pending_apply and isinstance(pending_apply["selected_features"], list):
-            st.session_state[selection_key] = [str(x) for x in pending_apply["selected_features"]]
-        if "top_k" in pending_apply:
-            st.session_state["final_submission_top_k"] = int(pending_apply["top_k"])
-        if "min_trades_per_year" in pending_apply:
-            st.session_state["final_submission_min_trades"] = float(pending_apply["min_trades_per_year"])
-        if "split_ratio" in pending_apply:
-            st.session_state["final_submission_split_ratio"] = float(pending_apply["split_ratio"])
-        if "ridge_alpha" in pending_apply:
-            st.session_state["final_submission_ridge_alpha"] = float(pending_apply["ridge_alpha"])
-        if "gb_rounds" in pending_apply:
-            st.session_state["final_submission_gb_rounds"] = int(pending_apply["gb_rounds"])
-        if "gb_learning_rate" in pending_apply:
-            st.session_state["final_submission_gb_lr"] = float(pending_apply["gb_learning_rate"])
-        if "final_model" in pending_apply:
-            st.session_state[forced_model_key] = str(pending_apply["final_model"])
-        st.session_state[show_fixed_key] = True
 
     if st.button("Show Best 5 Proposed Strategies", key="final_submission_show_best5_button"):
         st.session_state[show_fixed_key] = True
@@ -1707,9 +1686,11 @@ def render_final_submission_page(show_tutor: bool) -> None:
     if not st.session_state[selection_key]:
         st.session_state[selection_key] = default_features
 
-    def _apply_proposal_row(row: pd.Series) -> None:
+    applied_payload: Dict[str, object] | None = None
+
+    def _proposal_payload_from_row(row: pd.Series) -> Dict[str, object]:
         chosen_features = [s for s in str(row["features_csv"]).split("|") if s in options]
-        st.session_state[pending_apply_key] = {
+        return {
             "selected_features": chosen_features,
             "top_k": int(row["top_k"]),
             "min_trades_per_year": float(row["min_trades_per_year"]),
@@ -1741,14 +1722,12 @@ def render_final_submission_page(show_tutor: bool) -> None:
             selected_row = fixed_proposals[fixed_proposals["proposal_label"] == selected_proposal].iloc[0]
 
             if st.button("Apply Selected Proposed Strategy", key="final_submission_apply_fixed_choice"):
-                _apply_proposal_row(selected_row)
+                applied_payload = _proposal_payload_from_row(selected_row)
                 st.session_state[proposal_applied_key] = selected_proposal
-                st.rerun()
 
             if st.button("Apply Best Of Best (Top 1)", key="final_submission_apply_fixed_top1"):
-                _apply_proposal_row(fixed_proposals.iloc[0])
+                applied_payload = _proposal_payload_from_row(fixed_proposals.iloc[0])
                 st.session_state[proposal_applied_key] = str(fixed_proposals.iloc[0]["proposal_label"])
-                st.rerun()
 
             with st.expander("View fixed top 5", expanded=False):
                 st.dataframe(
@@ -1771,6 +1750,24 @@ def render_final_submission_page(show_tutor: bool) -> None:
                     use_container_width=True,
                     hide_index=True,
                 )
+
+    if isinstance(applied_payload, dict):
+        top_k = int(applied_payload["top_k"])
+        min_trades = float(applied_payload["min_trades_per_year"])
+        split_ratio = float(applied_payload["split_ratio"])
+        ridge_alpha = float(applied_payload["ridge_alpha"])
+        gb_rounds = int(applied_payload["gb_rounds"])
+        gb_lr = float(applied_payload["gb_learning_rate"])
+        st.session_state[forced_model_key] = str(applied_payload["final_model"])
+
+        feature_pool = build_submission_feature_pool(min_trades_per_year=float(min_trades))
+        eligible_pool = feature_pool["eligible"].copy()
+        default_features = list(feature_pool["default_features"])
+        options = eligible_pool["strategy"].tolist()
+        st.session_state[selection_key] = [s for s in applied_payload.get("selected_features", []) if s in options]
+        if not st.session_state[selection_key]:
+            st.session_state[selection_key] = default_features
+        st.info("Applied fixed proposal settings for this run.")
 
     if st.button("Reset Basket To Default Top 3"):
         st.session_state[selection_key] = default_features
